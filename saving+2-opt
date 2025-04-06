@@ -1,0 +1,897 @@
+import numpy as np
+import pandas as pd
+import requests
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from datetime import datetime, timedelta
+import math
+import folium
+import polyline
+import time
+import json
+
+# === 1. Data Configuration ===
+df_schools = pd.read_csv(
+    "C:/Users/ASUS/PycharmProjects/爬取多多买菜评论/results/schools_info_Kedungwaru.csv")  # Contains 'latitude', 'longitude', 'demand'
+central_kitchen = (-8.0506983, 111.911565)
+BATCH_SIZE = 50  # OSRM可以处理更大的批量请求
+OSRM_SERVER = "http://router.project-osrm.org"  # 公共OSRM服务器，也可以使用自己部署的服务器
+
+MAX_DELIVERY_TIME = 90  # Maximum delivery time for each cluster area (minutes)
+MAX_CAPACITY = 400  # Maximum delivery capacity for each cluster area
+MAX_SCHOOLS = 20  # Maximum number of schools served by the catering center
+START_TIME = datetime.strptime("9:30", "%H:%M")  # Delivery start time
+
+
+# Service time linear function
+def calculate_service_time(demand):
+    base_time = 10  # Base time (minutes)
+    time_per_person = 0.02  # Additional time per person
+    return base_time + time_per_person * demand
+
+
+# === 2. Get Delivery Times with OSRM ===
+def get_batch_travel_times_osrm(origins, destinations):
+
+    origins_formatted = [f"{lng},{lat}" for lat, lng in origins]
+    destinations_formatted = [f"{lng},{lat}" for lat, lng in destinations]
+
+    # 构建表格请求URL
+    coordinates = ";".join(origins_formatted + destinations_formatted)
+    sources = ";".join([str(i) for i in range(len(origins))])
+    destinations_indices = ";".join([str(len(origins) + i) for i in range(len(destinations))])
+
+    url = f"{OSRM_SERVER}/table/v1/driving/{coordinates}?sources={sources}&destinations={destinations_indices}"
+
+    try:
+        response = requests.get(url)
+        data = response.json()
+
+        travel_times = []
+        if data.get("code") == "Ok":
+            # OSRM返回的是秒，转换为分钟
+            durations = data.get("durations", [])
+            for row in durations:
+                travel_times.append([duration / 60 if duration is not None else np.inf for duration in row])
+        else:
+            print(f"OSRM API错误: {data.get('message', '未知错误')}")
+            travel_times = [[np.inf] * len(destinations)] * len(origins)
+    except Exception as e:
+        print(f"请求OSRM API时出错: {e}")
+        travel_times = [[np.inf] * len(destinations)] * len(origins)
+
+    return travel_times
+
+
+# Initialize delivery and return times
+df_schools["delivery_time"] = np.nan
+df_schools["return_time"] = np.nan
+df_schools["service_time"] = df_schools["demand"].apply(calculate_service_time)
+
+# 批量获取行程时间
+for i in range(0, len(df_schools), BATCH_SIZE):
+    batch = df_schools.iloc[i:i + BATCH_SIZE]
+    origins = [(central_kitchen[0], central_kitchen[1])] * len(batch)
+    destinations = list(zip(batch["latitude"], batch["longitude"]))
+
+    # 获取配送时间
+    travel_times = get_batch_travel_times_osrm(origins, destinations)
+    df_schools.loc[batch.index, "delivery_time"] = [time[0] for time in travel_times]
+
+    # 获取返回时间
+    return_times = get_batch_travel_times_osrm(destinations, origins)
+    df_schools.loc[batch.index, "return_time"] = [time[0] for time in return_times]
+
+df_schools["total_time"] = df_schools["delivery_time"] + df_schools["service_time"]
+
+# === 3. Select Most Suitable Schools ===
+# Sort by delivery time
+df_schools = df_schools.sort_values("total_time")
+
+# Select the first MAX_SCHOOLS schools
+selected_schools = df_schools.head(MAX_SCHOOLS).copy()
+rejected_schools = df_schools.tail(len(df_schools) - MAX_SCHOOLS).copy()
+
+# 打印结果
+print(f"已选择 {len(selected_schools)} 所学校，总需求量: {selected_schools['demand'].sum()}")
+print(f"最长配送时间: {selected_schools['total_time'].max():.2f} 分钟")
+
+# === 4. Improved Constraint-Based Clustering ===
+def get_euclidean_distance(point1, point2):
+    """Calculate Euclidean distance between two points"""
+    return math.sqrt(
+        (point1[0] - point2[0]) ** 2 + (point1[1] - point2[1]) ** 2) * 111  # Rough conversion to kilometers
+
+
+def improved_constrained_clusters(schools_df, central_kitchen, max_time=MAX_DELIVERY_TIME, max_capacity=MAX_CAPACITY):
+    """Improved cluster creation based on savings algorithm"""
+    clusters = []
+    travel_time_cache = {}
+    OSRM_SERVER = "http://router.project-osrm.org"  # 公共OSRM服务器，也可以使用自己部署的服务器
+
+    # Create a dictionary to record which route each school belongs to
+    school_to_route = {}
+
+    def get_cached_travel_time(origin, destination):
+        """Get travel time from cache, or via OSRM API if not exists"""
+        key = (origin, destination)
+        if key in travel_time_cache:
+            return travel_time_cache[key]
+
+        # 使用OSRM API获取行程时间
+        # OSRM使用经度,纬度格式，与传统格式相反
+        origin_str = f"{origin[1]},{origin[0]}"
+        destination_str = f"{destination[1]},{destination[0]}"
+
+        url = f"{OSRM_SERVER}/route/v1/driving/{origin_str};{destination_str}?overview=false"
+
+        try:
+            response = requests.get(url, timeout=10)
+            data = response.json()
+
+            if data.get("code") == "Ok" and len(data.get("routes", [])) > 0:
+                # OSRM返回的时间是秒，转换为分钟
+                travel_time = data["routes"][0]["duration"] / 60
+                travel_time_cache[key] = travel_time
+                travel_time_cache[(destination, origin)] = travel_time  # 假设双向行程时间相等
+                return travel_time
+            else:
+                print(f"OSRM API错误: {data.get('message', '未知错误')}")
+                return np.inf
+        except Exception as e:
+            print(f"请求错误: {e}")
+            return np.inf
+
+    # Initialize separate paths for each school
+    routes = []
+    for idx, school in enumerate(schools_df.iterrows()):
+        school_idx, school_data = school
+        school_location = (school_data["latitude"], school_data["longitude"])
+
+        # Calculate Euclidean distance to central kitchen
+        distance_to_kitchen = get_euclidean_distance(central_kitchen, school_location)
+
+        route = {
+            # Start explicitly with central kitchen, then to school
+            "path": [central_kitchen, school_location],
+            "total_time": get_cached_travel_time(central_kitchen, school_location) + school_data["service_time"],
+            "total_capacity": school_data["demand"],
+            "schools": [school_data],
+            "school_indices": [school_idx],  # Add school indices for better reference
+            "distance": distance_to_kitchen * 2  # Round-trip distance
+        }
+        routes.append(route)
+        school_to_route[school_idx] = len(routes) - 1  # Record which route contains this school
+
+    # Calculate savings values and sort
+    savings = []
+    for i, route_i in enumerate(routes):
+        for j, route_j in enumerate(routes):
+            if i != j:
+                # Get positions in the routes
+                loc_i = route_i["path"][1]  # School position in route i
+                loc_j = route_j["path"][1]  # School position in route j
+
+                # Use Euclidean distance to calculate savings (optimization calculation)
+                direct_distance = get_euclidean_distance(loc_i, loc_j)
+
+                # Calculate savings: distance of visiting two points separately minus distance of going directly from one point to another
+                # Higher value means combining these two points in one route is more cost-effective
+                saving = (
+                        get_euclidean_distance(central_kitchen, loc_i) +
+                        get_euclidean_distance(central_kitchen, loc_j) -
+                        direct_distance
+                )
+
+                # Add geographic proximity weight (prioritize combining geographically close schools)
+                geographic_weight = 1.0 / (direct_distance + 0.1)  # Avoid division by zero
+                weighted_saving = saving * geographic_weight
+
+                if saving > 0:  # Only add positive savings
+                    savings.append((weighted_saving, i, j, saving))
+
+    # Sort by weighted savings in descending order
+    savings.sort(reverse=True, key=lambda x: x[0])
+
+    # Improved route merging strategy
+    merged_routes = set()  # Track merged routes
+
+    for _, i, j, actual_saving in savings:
+        if i in merged_routes or j in merged_routes:
+            continue  # Skip already merged routes
+
+        if i >= len(routes) or j >= len(routes):  # Check if indices are valid
+            continue
+
+        route_i = routes[i]
+        route_j = routes[j]
+
+        # Get the last position of one route and first position of another
+        loc_i = route_i["path"][-1]  # Last school position
+        loc_j = route_j["path"][1]  # First school position (index 1, as 0 is central kitchen)
+
+        # Calculate time and capacity constraints
+        travel_time_between = get_cached_travel_time(loc_i, loc_j)
+
+        # More precise time calculation (considering path order)
+        time_from_kitchen_to_i_schools = route_i["total_time"] - get_cached_travel_time(route_i["path"][-1],
+                                                                                        central_kitchen)
+        time_from_j_schools_to_kitchen = get_cached_travel_time(route_j["path"][-1], central_kitchen)
+
+        new_total_time = (
+                time_from_kitchen_to_i_schools +
+                travel_time_between +
+                route_j["total_time"] -
+                get_cached_travel_time(central_kitchen, loc_j)  # Subtract duplicated time calculation
+        )
+
+        new_total_capacity = route_i["total_capacity"] + route_j["total_capacity"]
+
+        # Check constraints
+        if new_total_time <= max_time and new_total_capacity <= max_capacity:
+            # Merge routes - maintain path continuity
+            combined_path = route_i["path"].copy()  # Copy route_i's path
+            # Add route_j's path points (except the first point, which is the central kitchen)
+            combined_path.extend(route_j["path"][1:])
+
+            # Calculate total distance of the new path
+            total_distance = 0
+            for k in range(len(combined_path) - 1):
+                total_distance += get_euclidean_distance(combined_path[k], combined_path[k + 1])
+            # Add distance from last school back to central kitchen
+            total_distance += get_euclidean_distance(combined_path[-1], central_kitchen)
+
+            route_i["path"] = combined_path
+            route_i["total_time"] = new_total_time
+            route_i["total_capacity"] = new_total_capacity
+            route_i["schools"].extend(route_j["schools"])  # Merge school lists
+            route_i["school_indices"].extend(route_j["school_indices"])  # Merge school indices
+            route_i["distance"] = total_distance  # Update distance
+
+            # Update all school mappings moving from route_j to route_i
+            for school_idx in route_j["school_indices"]:
+                school_to_route[school_idx] = i  # Update to new path
+
+            # Mark j as merged
+            merged_routes.add(j)
+
+    # Filter out merged paths
+    final_routes = [route for idx, route in enumerate(routes) if idx not in merged_routes]
+
+    # Save results
+    for cluster_id, route in enumerate(final_routes):
+        # Create complete pathways to ensure that the central kitchen is the starting and ending point
+        complete_path = []
+
+        # Add all points in the route
+        for loc in route["path"]:
+            complete_path.append(loc)
+
+        # Ensure that the central kitchen is the last point (if not)
+        if complete_path[-1] != central_kitchen:
+            complete_path.append(central_kitchen)
+
+        # Calculate the return time from the last school to the central kitchen
+        last_school = route["path"][-1]
+        return_time = get_cached_travel_time(last_school, central_kitchen)
+
+        # Recalculate total path distance
+        total_distance = 0
+        for i in range(len(complete_path) - 1):
+            total_distance += get_euclidean_distance(complete_path[i], complete_path[i + 1])
+
+        clusters.append({
+            "cluster_id": cluster_id,
+            "path": complete_path,  # Complete pathways, including centralized kitchens at the start and end points
+            "total_time": route["total_time"],
+            "total_capacity": route["total_capacity"],
+            "return_time": return_time,
+            "total_time_with_return": route["total_time"] + return_time,
+            "distance": total_distance,
+            "schools": route["schools"],
+            "school_indices": route["school_indices"]
+        })
+
+    return clusters
+
+
+# === 5. 2-opt Local Search Algorithm for Path Optimization ===
+def two_opt_optimization(cluster, distance_function, max_iterations=100):
+
+    # Extract locations and indices
+    locations = cluster["path"]
+    school_indices = cluster["school_indices"]
+
+    # Create a fixed starting/ending point (central kitchen)
+    kitchen = locations[0]
+
+    # Create a route including only the school locations (exclude kitchen)
+    route = locations[1:-1]  # Remove kitchen at start and end
+    indices = school_indices.copy()
+
+    # If route has fewer than 3 points, 2-opt won't improve it
+    if len(route) < 3:
+        return cluster
+
+    # Function to calculate total route distance
+    def calculate_route_distance(rt):
+        # Add kitchen at start and end
+        full_route = [kitchen] + rt + [kitchen]
+        total = 0
+        for i in range(len(full_route) - 1):
+            total += distance_function(full_route[i], full_route[i + 1])
+        return total
+
+    # Initial distance
+    best_distance = calculate_route_distance(route)
+
+    # Track improvements
+    improvement = True
+    iteration = 0
+
+    # Continue until no improvement or max iterations reached
+    while improvement and iteration < max_iterations:
+        improvement = False
+        iteration += 1
+
+        # 2-opt swaps
+        for i in range(len(route) - 1):
+            for j in range(i + 1, len(route)):
+                # Skip adjacent edges
+                if j == i + 1:
+                    continue
+
+                # Create new route with 2-opt swap: reverse segment between i and j
+                new_route = route.copy()
+                new_route[i + 1:j + 1] = reversed(route[i + 1:j + 1])
+
+                # Also swap the corresponding indices
+                new_indices = indices.copy()
+                new_indices[i + 1:j + 1] = reversed(indices[i + 1:j + 1])
+
+                # Calculate new distance
+                new_distance = calculate_route_distance(new_route)
+
+                # If better, update the route
+                if new_distance < best_distance:
+                    route = new_route
+                    indices = new_indices
+                    best_distance = new_distance
+                    improvement = True
+                    break  # Restart with new route
+
+            if improvement:
+                break
+
+    # Create optimized path with kitchen at start and end
+    optimized_path = [kitchen] + route + [kitchen]
+
+    # Create a new optimized cluster
+    optimized_cluster = cluster.copy()
+    optimized_cluster["path"] = optimized_path
+    optimized_cluster["school_indices"] = indices
+    optimized_cluster["distance"] = best_distance
+
+    # Recalculate times based on the new path
+    # This is a simplified version - consider recalculating travel times accurately
+    optimized_cluster["total_time"] = cluster["total_time"]  # Simplified
+    optimized_cluster["return_time"] = cluster["return_time"]  # Simplified
+    optimized_cluster["total_time_with_return"] = cluster["total_time_with_return"]  # Simplified
+
+    return optimized_cluster
+
+
+# === 6. Implementing clustering and 2-opt optimization ===
+print("Performing initial clustering...")
+constrained_clusters = improved_constrained_clusters(selected_schools, central_kitchen)
+
+print("Applying 2-opt optimization to each cluster...")
+optimized_clusters = []
+
+for cluster in constrained_clusters:
+    print(f"Optimizing cluster {cluster['cluster_id']}...")
+
+    # Apply 2-opt optimization
+    optimized_cluster = two_opt_optimization(cluster, get_euclidean_distance)
+
+    optimized_clusters.append(optimized_cluster)
+
+# Update constrained_clusters with optimized ones
+constrained_clusters = optimized_clusters
+
+
+# === 记录优化路径结果 ===
+def update_schools_clustering_with_return_time(df_schools, constrained_clusters, central_kitchen):
+    """Update school data frame to include clustering information, path order and return time"""
+    updated_df = df_schools.copy()
+
+    # Unassigned by default
+    updated_df["cluster"] = -1
+    updated_df["stop_order"] = -1
+
+    # Updated information for schools in each cluster
+    for cluster in constrained_clusters:
+        cluster_id = cluster["cluster_id"]
+
+        # Get the order of schools in the path
+        path_schools = cluster["school_indices"]
+
+        # Update school cluster IDs and visit order
+        for i, school_idx in enumerate(path_schools):
+            updated_df.loc[school_idx, "cluster"] = cluster_id
+            updated_df.loc[school_idx, "stop_order"] = i + 1  # Order starts from 1
+
+    return updated_df
+
+
+# Merge results and update data
+df_result = update_schools_clustering_with_return_time(df_schools, constrained_clusters, central_kitchen)
+
+
+# === 创建可视化图表 ===
+def create_improved_visualization(df_result, central_kitchen, constrained_clusters, total_schools, selected_schools):
+    plt.figure(figsize=(12, 10))
+
+    # Extract all coordinate points to display
+    all_lats = [central_kitchen[0]]  # Central kitchen latitude
+    all_lons = [central_kitchen[1]]  # Central kitchen longitude
+
+    for _, row in df_result[df_result['cluster'] >= 0].iterrows():
+        all_lats.append(row['latitude'])
+        all_lons.append(row['longitude'])
+
+    # Calculate relative coordinates (in the range 0-20)
+    min_lat, max_lat = min(all_lats), max(all_lats)
+    min_lon, max_lon = min(all_lons), max(all_lons)
+
+    # Coordinate conversion functions
+    def convert_to_relative(lat, lon):
+        # Mapping latitude and longitude ranges to 0-20
+        rel_x = 20 * (lon - min_lon) / (max_lon - min_lon) if max_lon != min_lon else 0
+        rel_y = 20 * (lat - min_lat) / (max_lat - min_lat) if max_lat != min_lat else 0
+        return rel_x, rel_y
+
+    # Converted central kitchen coordinates
+    kitchen_x, kitchen_y = convert_to_relative(central_kitchen[0], central_kitchen[1])
+
+    # Create a dictionary of school coordinates
+    school_coords = {}
+    for idx, row in df_result[df_result['cluster'] >= 0].iterrows():
+        x, y = convert_to_relative(row['latitude'], row['longitude'])
+        school_coords[idx] = (x, y)
+
+    # Plot the path of each cluster in different color schemes
+    distinct_colors = ['blue', 'red', 'green', 'olive', 'purple', 'teal', 'orange', 'brown']
+    for i, cluster in enumerate(constrained_clusters):
+        cluster_id = cluster["cluster_id"]
+        color = distinct_colors[cluster_id % len(distinct_colors)]
+
+        # Add all points in the path
+        path = []
+        for location in cluster["path"]:
+            if location == central_kitchen:
+                path.append((kitchen_x, kitchen_y))
+            else:
+                # Find the school index that matches this location
+                for idx, row in df_result.iterrows():
+                    if (row['latitude'], row['longitude']) == location:
+                        path.append(school_coords[idx])
+                        break
+
+        # Draw path lines
+        xs, ys = zip(*path)
+        plt.plot(xs, ys, '-', color=color, linewidth=2, label=f"Route {cluster_id}")
+
+        # Mark school nodes and order on the path
+        for j, (x, y) in enumerate(path[1:-1], 0):
+            plt.plot(x, y, 'o', color=color, markersize=8)
+            # Add school number
+            school_idx = cluster["school_indices"][j]
+            plt.text(x, y, str(school_idx), fontsize=10, ha='center', va='bottom')
+
+        # Add arrows to mark the delivery order
+        for j in range(len(path) - 1):
+            dx = path[j + 1][0] - path[j][0]
+            dy = path[j + 1][1] - path[j][1]
+
+            # Calculate the position of the arrow (about 20% from the midpoint)
+            arrow_x = path[j][0] + dx * 0.4
+            arrow_y = path[j][1] + dy * 0.4
+
+            # Calculating arrow directions
+            arrow_length = 0.5
+            arrow_dx = dx * arrow_length / math.sqrt(dx ** 2 + dy ** 2)
+            arrow_dy = dy * arrow_length / math.sqrt(dx ** 2 + dy ** 2)
+
+            # Draw arrows
+            plt.arrow(arrow_x, arrow_y, arrow_dx, arrow_dy,
+                      head_width=0.4, head_length=0.6, fc=color, ec=color)
+
+    # Mark the central kitchen
+    plt.plot(kitchen_x, kitchen_y, 's', color='black', markersize=10)
+    plt.text(kitchen_x, kitchen_y, 'Kitchen', fontsize=10, ha='center', va='bottom')
+
+    # Set chart properties
+    plt.xlim(0, 20)
+    plt.ylim(0, 20)
+    plt.xlabel('Relative X Position')
+    plt.ylabel('Relative Y Position')
+    plt.legend(loc='upper right')
+
+    plt.title(
+        f'School Delivery Routes with 2-opt Optimization\nTotal Schools: {total_schools}, Selected Schools: {selected_schools}',
+        fontsize=14)
+    plt.grid(True, linestyle='--', alpha=0.7)
+
+    # Calculate path information
+    route_distances = [round(cluster["distance"], 2) for cluster in constrained_clusters]
+    route_demands = [round(cluster["total_capacity"], 1) for cluster in constrained_clusters]
+
+    # Construct optimal program strings
+    optimal_routes = []
+    for cluster in constrained_clusters:
+        route = [0]  # Starting from the central kitchen
+        route.extend(cluster["school_indices"])
+        route.append(0)  # Back to the central kitchen
+        optimal_routes.append(route)
+
+    # Combine all paths into a display list
+    all_routes = []
+    for r in optimal_routes:
+        if len(all_routes) > 0 and all_routes[-1] == 0:
+            all_routes.extend(r[1:])  # Don't duplicate the kitchen (0)
+        else:
+            all_routes.extend(r)
+
+    # Add statistical information below the chart
+    total_distance = sum(cluster["distance"] for cluster in constrained_clusters)
+    plt.figtext(0.5, 0.01,
+                f"Total Distance: {round(total_distance, 1)} km, Optimal Solution: {all_routes}\n"
+                f"Distance of each route: {route_distances} km\n"
+                f"Delivery Capacity per route: {route_demands}",
+                ha="center", fontsize=10, bbox={"facecolor": "lightgray", "alpha": 0.5, "pad": 5})
+
+    return plt
+
+
+# === 生成并保存图表 ===
+total_schools_count = len(df_schools)
+selected_schools_count = len(selected_schools)
+
+plt_obj = create_improved_visualization(df_result, central_kitchen, constrained_clusters,
+                                        total_schools_count, selected_schools_count)
+plt_obj.savefig('school_routes_with_2opt_optimization.png', dpi=300, bbox_inches='tight')
+plt.close()
+print("The visualization chart has been saved as school_routes_with_2opt_optimization.png")
+
+# === 输出优化路线统计信息 ===
+print("\n=== Optimized Routes Statistical Information ===")
+print(f"Total Schools: {total_schools_count}")
+print(f"Selected Schools: {selected_schools_count}")
+print("Cluster | Schools | Total Time (min)| Total Capacity | Route Length (km) | Optimized Path")
+
+# 输出每个聚类的统计信息
+for cluster in constrained_clusters:
+    cluster_id = cluster["cluster_id"]
+    num_schools = len(cluster["school_indices"])
+    total_time = cluster["total_time_with_return"]
+    total_capacity = cluster["total_capacity"]
+    distance = cluster["distance"]
+    path = [0] + cluster["school_indices"] + [0]  # Format: [0, school1, school2, ..., 0]
+    print(
+        f"{cluster_id:>7} | {num_schools:>7} | {total_time:>15.2f} | {total_capacity:>14} | {distance:>16.2f} | {path}")
+
+# 构建所有路线的优化解
+all_routes = []
+for cluster in constrained_clusters:
+    route = [0]  # Starting from the central kitchen
+    route.extend(cluster["school_indices"])
+    route.append(0)  # Back to the central kitchen
+    all_routes.extend(route[:-1] if all_routes else route)
+if all_routes[-1] != 0:
+    all_routes.append(0)
+
+print(f"Complete Optimized Solution: {all_routes}")
+print(f"Route Lengths (km): {[round(cluster['distance'], 2) for cluster in constrained_clusters]}")
+print(f"Route Capacities: {[round(cluster['total_capacity'], 1) for cluster in constrained_clusters]}")
+
+
+def generate_detailed_school_report(df_result, constrained_clusters, start_time=START_TIME):
+    # 创建详细报告DataFrame
+    detailed_report = []
+    for cluster in constrained_clusters:
+        cluster_id = cluster["cluster_id"]
+        current_time = start_time
+
+        for idx, school_data in enumerate(cluster["schools"]):
+            school_idx = cluster["school_indices"][idx]
+            school_row = df_result.loc[school_idx]
+
+            # 计算时间
+            delivery_time = school_row['delivery_time']
+            service_time = school_row['service_time']
+            return_time = school_row['return_time']
+            total_route_time = delivery_time + service_time + return_time
+
+            # 计算开始和结束时间
+            delivery_start_time = current_time
+            service_start_time = delivery_start_time + timedelta(minutes=delivery_time)
+            service_end_time = service_start_time + timedelta(minutes=service_time)
+            delivery_end_time = service_end_time + timedelta(minutes=return_time)
+
+            detailed_report.append({
+                'Cluster': cluster_id,
+                'School Index': school_idx,
+                'School Name': school_row.get('name', 'N/A'),
+                'NPSN': school_row.get('npsn', 'N/A'),
+                'Latitude': school_row['latitude'],
+                'Longitude': school_row['longitude'],
+                'Demand': school_row['demand'],
+                'Delivery Start Time': delivery_start_time.strftime("%H:%M"),
+                'Service Start Time': service_start_time.strftime("%H:%M"),
+                'Service End Time': service_end_time.strftime("%H:%M"),
+                'Delivery End Time': delivery_end_time.strftime("%H:%M"),
+                'Delivery Time (mins)': round(delivery_time, 2),
+                'Service Time (mins)': round(service_time, 2),
+                'Return Time (mins)': round(return_time, 2),
+                'Total Route Time (mins)': round(total_route_time, 2),
+                'Stop Order in Cluster': idx + 1
+            })
+
+            # 更新当前时间
+            current_time = delivery_end_time
+
+    # 转换为DataFrame并保存
+    detailed_df = pd.DataFrame(detailed_report)
+    detailed_df.to_csv('detailed_delivery_routes.csv', index=False)
+    return detailed_df
+
+
+def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitchen, MAX_DELIVERY_TIME, MAX_CAPACITY,
+                                   start_time=START_TIME, osrm_server="http://router.project-osrm.org"):
+    # 创建地图，以中央厨房为中心
+    m = folium.Map(location=[central_kitchen[0], central_kitchen[1]], zoom_start=10)
+
+    # 为不同集群设置不同颜色
+    colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 'lightred', 'beige']
+
+    # 计算统计信息
+    total_schools = len(df_result)
+    selected_schools = len(df_result[df_result['cluster'] >= 0])
+    total_clusters = len(constrained_clusters)
+
+    # 计算总配送时间
+    overall_start_time = start_time
+    overall_end_time = start_time
+
+    # 追踪所有路线的总配送时间
+    for cluster in constrained_clusters:
+        cluster_end_time = start_time
+        for school_idx in cluster["school_indices"]:
+            school_data = df_result.loc[school_idx]
+            delivery_time = school_data['delivery_time']
+            service_time = school_data['service_time']
+
+            # 计算此学校的完成时间
+            cluster_end_time += timedelta(minutes=delivery_time + service_time)
+
+        # 更新总结束时间
+        if cluster_end_time > overall_end_time:
+            overall_end_time = cluster_end_time
+
+    # 计算总配送时间（分钟）
+    total_delivery_duration = (overall_end_time - overall_start_time).total_seconds() / 60
+
+    # 添加中央厨房标记
+    central_kitchen_popup = f"""
+    <div style='font-family: Arial, sans-serif; max-width: 300px;'>
+    <h3 style='color: #333;'>中央厨房详情</h3>
+    <p><strong>位置:</strong> {central_kitchen[0]}, {central_kitchen[1]}<br>
+    <strong>分析的学校总数:</strong> {len(df_result)}<br>
+    <strong>已选择学校:</strong> {len(df_result[df_result['cluster'] >= 0])}<br>
+    <strong>形成的集群:</strong> {len(constrained_clusters)}<br>
+    <strong>配送约束:</strong><br>
+    - 最大配送时间: {MAX_DELIVERY_TIME} 分钟<br>
+    - 最大容量: 每个集群 {MAX_CAPACITY}<br>
+    <strong>配送开始时间:</strong> {start_time.strftime("%H:%M")}<br>
+    <strong>配送结束时间:</strong> {overall_end_time.strftime("%H:%M")}
+    </p>
+    </div>
+    """
+
+    folium.Marker(
+        location=central_kitchen,
+        popup=folium.Popup(central_kitchen_popup, max_width=350),
+        icon=folium.Icon(color='black', icon='home')
+    ).add_to(m)
+
+    # 获取两点之间的路线
+    def get_osrm_route(origin, destination):
+        url = f"{osrm_server}/route/v1/driving/{origin[1]},{origin[0]};{destination[1]},{destination[0]}"
+        params = {
+            "overview": "full",
+            "geometries": "geojson"
+        }
+
+        try:
+            response = requests.get(url, params=params)
+            data = response.json()
+
+            if data["code"] == "Ok":
+                coordinates = data["routes"][0]["geometry"]["coordinates"]
+                route_points = [[coord[1], coord[0]] for coord in coordinates]
+                return route_points
+            else:
+                return [origin, destination]  # 直线备选
+        except Exception as e:
+            return [origin, destination]  # 直线备选
+
+    # 跟踪总分配时间
+    total_delivery_time = start_time
+
+    for cluster_idx, cluster in enumerate(constrained_clusters):
+        # 为此集群选择颜色
+        cluster_color = colors[cluster_idx % len(colors)]
+
+        # 跟踪集群详情
+        cluster_schools = []
+        cluster_details = []
+
+        # 获取有序点列表（包括开始和结束的中央厨房）
+        ordered_points = [central_kitchen]
+        for school_idx in cluster["school_indices"]:
+            school_data = df_result.loc[school_idx]
+            school_location = (school_data['latitude'], school_data['longitude'])
+            ordered_points.append(school_location)
+        ordered_points.append(central_kitchen)  # 返回中央厨房
+
+        # 为该集群的每个学校添加标记
+        for idx, school_idx in enumerate(cluster["school_indices"]):
+            school_data = df_result.loc[school_idx]
+
+            # 计算配送时间
+            delivery_time = school_data['delivery_time']
+            service_time = school_data['service_time']
+            return_time = school_data['return_time']
+
+            # 计算精确时间
+            delivery_start_time = total_delivery_time
+            service_start_time = delivery_start_time + timedelta(minutes=delivery_time)
+            service_end_time = service_start_time + timedelta(minutes=service_time)
+            delivery_end_time = service_end_time + timedelta(minutes=return_time)
+
+            # 为下一个迭代更新
+            total_delivery_time = delivery_end_time
+            details = {
+                'name': school_data['name'],
+                'delivery_start': delivery_start_time.strftime("%H:%M"),
+                'service_start': service_start_time.strftime("%H:%M"),
+                'service_end': service_end_time.strftime("%H:%M"),
+                'delivery_end': delivery_end_time.strftime("%H:%M"),
+                'demand': school_data['demand']
+            }
+
+            # 添加学校详情供弹出窗口使用
+            cluster_schools.append(school_data['name'])
+            cluster_details.append(details)
+
+            # 创建配送顺序数字标记
+            delivery_order = idx + 1  # 从1开始
+
+            # 为每个学校创建详细弹出窗口
+            school_popup = f"""
+            <div style='font-family: Arial, sans-serif; max-width: 300px;'>
+            <h3 style='color: #{cluster_color};'>学校详情</h3>
+            <p>
+            <strong>名称:</strong> {details['name']}<br>
+            <strong>NPSN:</strong> {school_data.get('npsn', 'N/A')}<br>
+            <strong>位置:</strong> {school_data['latitude']}, {school_data['longitude']}<br>
+            <strong>需求:</strong> {details['demand']}<br>
+            <strong>集群:</strong> {cluster_idx}<br>
+            <strong>配送顺序:</strong> {delivery_order}<br>
+            <br>
+            <strong>配送时间表:</strong><br>
+            - 配送开始: {details['delivery_start']}<br>
+            - 服务开始: {details['service_start']}<br>
+            - 服务结束: {details['service_end']}<br>
+            - 配送结束: {details['delivery_end']}
+            </p>
+            </div>
+            """
+
+            # 显示配送顺序
+            folium.CircleMarker(
+                location=(school_data['latitude'], school_data['longitude']),
+                radius=15,
+                color=cluster_color,
+                fill=True,
+                fill_color=cluster_color,
+                fill_opacity=0.7,
+                popup=folium.Popup(school_popup, max_width=350),
+            ).add_to(m)
+
+            # 添加路线方向指示
+            folium.map.Marker(
+                location=(school_data['latitude'], school_data['longitude']),
+                icon=folium.DivIcon(
+                    icon_size=(20, 20),
+                    icon_anchor=(10, 10),
+                    html=f'<div style="font-size: 12px; color: white; font-weight: bold; text-align: center;">{delivery_order}</div>'
+                )
+            ).add_to(m)
+
+        # 集群路线详细弹出窗口
+        route_popup = f"""
+        <div style='font-family: Arial, sans-serif; max-width: 350px;'>
+        <h3 style='color: #{cluster_color};'>集群 {cluster_idx} 路线详情</h3>
+        <hr style='border-top: 1px solid #ddd;'>
+        <p>
+        <strong>集群中的学校:</strong> {len(cluster['school_indices'])}<br>
+        <strong>学校名称:</strong> {', '.join(cluster_schools)}<br>
+        <strong>总配送时间:</strong> {cluster['total_time_with_return']:.2f} 分钟<br>
+        <strong>总容量:</strong> {cluster['total_capacity']}<br>
+        <strong>路线距离:</strong> {cluster['distance']:.2f} 公里<br>
+        <strong>配送顺序:</strong> 中央厨房 → {' → '.join([str(i + 1) for i in range(len(cluster['school_indices']))])} → 中央厨房
+        </p>
+        </div>
+        """
+
+        # 对于路线的每个段，获取实际道路路径
+        for i in range(len(ordered_points) - 1):
+            origin = ordered_points[i]
+            destination = ordered_points[i + 1]
+
+            # 使用OSRM获取路线点
+            route_points = get_osrm_route(origin, destination)
+
+            # 添加小延迟以避免超过速率限制
+            time.sleep(0.2)
+
+            # 添加路线标记以显示部分编号
+            route_label = ""
+            if i == 0:
+                route_label = "中央厨房 → 学校 1"
+            elif i == len(ordered_points) - 2:
+                route_label = f"学校 {i} → 中央厨房"
+            else:
+                route_label = f"学校 {i} → 学校 {i + 1}"
+
+            # 向地图添加路线段
+            route_line = folium.PolyLine(
+                locations=route_points,
+                color=cluster_color,
+                weight=3,
+                opacity=0.8,
+                popup=folium.Popup(route_popup, max_width=350) if i == 0 else None,
+                tooltip=route_label
+            ).add_to(m)
+
+            # 添加指示方向的箭头
+            if len(route_points) > 1:
+                middle_point = route_points[len(route_points) // 2]
+
+                # 使用小圆圈标记方向
+                folium.CircleMarker(
+                    location=middle_point,
+                    radius=3,
+                    color=cluster_color,
+                    fill=True,
+                    fill_opacity=1.0,
+                    tooltip=f"方向: {route_label}"
+                ).add_to(m)
+
+    # 保存地图
+    m.save('school_routes_map(saving + 2-opt).html')
+    return m
+
+
+# 生成详细报告和地图
+detailed_school_report = generate_detailed_school_report(df_result, constrained_clusters)
+create_osrm_maps_visualization(
+    df_result,
+    constrained_clusters,
+    central_kitchen,
+    MAX_DELIVERY_TIME,
+    MAX_CAPACITY
+)
