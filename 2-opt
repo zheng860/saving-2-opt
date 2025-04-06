@@ -1,0 +1,1034 @@
+import numpy as np
+import pandas as pd
+import requests
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+import folium
+import polyline
+import time
+import json
+from datetime import datetime, timedelta
+import math
+from functools import lru_cache
+import os
+
+# === 1. Data Configuration ===
+df_schools = pd.read_csv(
+    "C:/Users/ASUS/PycharmProjects/爬取多多买菜评论/results/schools_info_Kedungwaru.csv")
+central_kitchen = (-8.0506983, 111.911565)
+MAX_DELIVERY_TIME = 90  # Maximum delivery time for each cluster area (minutes)
+MAX_CAPACITY = 400  # Maximum delivery capacity for each cluster area
+MAX_SCHOOLS = 20  # Maximum number of schools served by the catering center
+START_TIME = datetime.strptime("9:30", "%H:%M")  # Delivery start time
+
+# === 2. Distance & Time Calculation===
+OSRM_BASE_URL = "http://router.project-osrm.org/route/v1/driving/"
+
+# Use LRU cache to efficiently store results
+@lru_cache(maxsize=1000)
+def get_osrm_route(origin, destination):
+    """Get route between two points using OSRM API with caching"""
+    url = f"{OSRM_BASE_URL}{origin[1]},{origin[0]};{destination[1]},{destination[0]}?overview=full&annotations=true"
+
+    try:
+        response = requests.get(url)
+        data = response.json()
+
+        if data.get("code") == "Ok" and "routes" in data and len(data["routes"]) > 0:
+            # Extract duration (seconds -> minutes)
+            duration_minutes = data["routes"][0]["duration"] / 60
+
+            # Extract distance (meters -> kilometers)
+            distance_km = data["routes"][0]["distance"] / 1000
+
+            # Extract geometry for visualization
+            geometry = data["routes"][0]["geometry"]
+
+            return {
+                "duration": duration_minutes,
+                "distance": distance_km,
+                "geometry": geometry
+            }
+        else:
+            print(f"Error in OSRM response: {data}")
+            # Calculate fallback Euclidean distance (approximate)
+            distance = math.sqrt(
+                (origin[0] - destination[0]) ** 2 +
+                (origin[1] - destination[1]) ** 2
+            ) * 111  # Rough conversion to kilometers
+
+            # Estimate duration (assuming 30 km/h average speed)
+            duration = (distance / 30) * 60
+
+            return {
+                "duration": duration,
+                "distance": distance,
+                "geometry": None
+            }
+
+    except Exception as e:
+        print(f"OSRM API request error: {e}")
+        # Calculate fallback Euclidean distance
+        distance = math.sqrt(
+            (origin[0] - destination[0]) ** 2 +
+            (origin[1] - destination[1]) ** 2
+        ) * 111
+
+        # Estimate duration
+        duration = (distance / 30) * 60
+
+        return {
+            "duration": duration,
+            "distance": distance,
+            "geometry": None
+        }
+
+def batch_get_travel_info(origins, destinations):
+    """Get travel information between multiple origins and destinations"""
+    if not isinstance(origins[0], (list, tuple)):
+        origins = [origins]
+    if not isinstance(destinations[0], (list, tuple)):
+        destinations = [destinations]
+
+    results = []
+    for origin in origins:
+        row = []
+        for dest in destinations:
+            route_info = get_osrm_route(origin, dest)
+            row.append(route_info["duration"])
+        results.append(row)
+
+    # Return appropriate shape based on input
+    if len(origins) == 1 and len(destinations) == 1:
+        return results[0][0]
+    return results
+
+# Service time calculation function
+def calculate_service_time(demand):
+    base_time = 10  # Base time (minutes)
+    time_per_person = 0.02  # Additional time per person
+    return base_time + time_per_person * demand
+
+
+# === 3. Process School Data ===
+def process_school_data(df_schools, central_kitchen):
+    """Calculate delivery and return times for all schools"""
+    processed_df = df_schools.copy()
+
+    # Calculate service time based on demand
+    processed_df["service_time"] = processed_df["demand"].apply(calculate_service_time)
+
+    # Calculate delivery and return times - process in smaller batches to avoid overwhelming API
+    batch_size = 10
+    processed_df["delivery_time"] = np.nan
+    processed_df["return_time"] = np.nan
+
+    for i in range(0, len(processed_df), batch_size):
+        batch = processed_df.iloc[i:i + batch_size]
+        batch_coords = list(zip(batch["latitude"], batch["longitude"]))
+
+        # Get delivery times (kitchen to school)
+        for j, coords in enumerate(batch_coords):
+            idx = batch.index[j]
+            route = get_osrm_route(central_kitchen, coords)
+            processed_df.loc[idx, "delivery_time"] = route["duration"]
+
+            # Get return times (school to kitchen)
+            route = get_osrm_route(coords, central_kitchen)
+            processed_df.loc[idx, "return_time"] = route["duration"]
+
+    # Calculate total time
+    processed_df["total_time"] = processed_df["delivery_time"] + processed_df["service_time"] + processed_df[
+        "return_time"]
+
+    # Sort by total time
+    processed_df = processed_df.sort_values("total_time")
+
+    return processed_df
+
+
+# === 4. Optimized K-means Clustering ===
+def kmeans_clustering(schools_df, central_kitchen, initial_clusters=4):
+    """Improved K-means clustering with constraint handling"""
+    print(f"Starting K-means clustering with {initial_clusters} initial clusters...")
+
+    # Extract coordinates for clustering
+    X = schools_df[["latitude", "longitude"]].values
+
+    # Run K-means
+    kmeans = KMeans(n_clusters=initial_clusters, random_state=42, n_init=10)
+    kmeans_labels = kmeans.fit_predict(X)
+
+    # Add cluster labels to dataframe
+    temp_df = schools_df.copy()
+    temp_df["kmeans_cluster"] = kmeans_labels
+
+    # Process each cluster
+    final_clusters = []
+    cluster_id = 0
+
+    for i in range(initial_clusters):
+        # Get schools in this cluster
+        cluster_df = temp_df[temp_df["kmeans_cluster"] == i].copy()
+
+        if len(cluster_df) == 0:
+            continue
+
+        # Check capacity constraint
+        total_demand = cluster_df["demand"].sum()
+
+        if total_demand > MAX_CAPACITY:
+            print(f"Cluster {i} exceeds capacity ({total_demand} > {MAX_CAPACITY}). Splitting.")
+
+            # Calculate distance to kitchen for proper sorting
+            cluster_df["dist_to_kitchen"] = cluster_df.apply(
+                lambda row: get_osrm_route(central_kitchen, (row["latitude"], row["longitude"]))["distance"],
+                axis=1
+            )
+
+            # Sort by distance and split into subclusters
+            sorted_cluster = cluster_df.sort_values("dist_to_kitchen")
+
+            # Create subclusters that respect capacity
+            current_capacity = 0
+            current_schools = []
+            current_indices = []
+
+            for idx, school in sorted_cluster.iterrows():
+                if current_capacity + school["demand"] <= MAX_CAPACITY:
+                    current_capacity += school["demand"]
+                    current_schools.append(school.to_dict())
+                    current_indices.append(idx)
+                else:
+                    # Complete current subcluster
+                    if current_schools:
+                        subcluster = create_route(current_schools, current_indices, central_kitchen)
+                        subcluster["cluster_id"] = cluster_id
+                        final_clusters.append(subcluster)
+                        cluster_id += 1
+
+                    # Start new subcluster
+                    current_capacity = school["demand"]
+                    current_schools = [school.to_dict()]
+                    current_indices = [idx]
+
+            # Add final subcluster if not empty
+            if current_schools:
+                subcluster = create_route(current_schools, current_indices, central_kitchen)
+                subcluster["cluster_id"] = cluster_id
+                final_clusters.append(subcluster)
+                cluster_id += 1
+
+        else:
+            # Cluster respects capacity, create route
+            school_indices = cluster_df.index.tolist()
+            school_list = [schools_df.loc[idx].to_dict() for idx in school_indices]
+
+            subcluster = create_route(school_list, school_indices, central_kitchen)
+
+            # Check time constraint
+            if subcluster["total_time"] <= MAX_DELIVERY_TIME:
+                subcluster["cluster_id"] = cluster_id
+                final_clusters.append(subcluster)
+                cluster_id += 1
+            else:
+                # Split by time using nearest neighbor approach
+                split_clusters = split_by_time_constraint(school_list, school_indices, central_kitchen)
+
+                for sc in split_clusters:
+                    sc["cluster_id"] = cluster_id
+                    final_clusters.append(sc)
+                    cluster_id += 1
+
+    return final_clusters
+
+
+# === 5. Route Creation and Optimization ===
+def create_route(schools, school_indices, central_kitchen):
+    """Create optimal route through schools using nearest neighbor heuristic"""
+    # Start with kitchen
+    path = [central_kitchen]
+    ordered_schools = []
+    ordered_indices = []
+
+    # Convert to locations
+    locations = [(s["latitude"], s["longitude"]) for s in schools]
+
+    # Start with closest school to kitchen
+    best_idx = None
+    min_distance = float('inf')
+
+    for i, loc in enumerate(locations):
+        route = get_osrm_route(central_kitchen, loc)
+        if route["duration"] < min_distance:
+            min_distance = route["duration"]
+            best_idx = i
+
+    current_loc = locations[best_idx]
+    path.append(current_loc)
+    ordered_schools.append(schools[best_idx])
+    ordered_indices.append(school_indices[best_idx])
+
+    # Remove first school from candidates
+    remaining_locs = locations.copy()
+    remaining_schools = schools.copy()
+    remaining_indices = school_indices.copy()
+    remaining_locs.pop(best_idx)
+    remaining_schools.pop(best_idx)
+    remaining_indices.pop(best_idx)
+
+    # Build route using nearest neighbor
+    total_time = min_distance + schools[best_idx]["service_time"]
+    total_distance = get_osrm_route(central_kitchen, current_loc)["distance"]
+
+    while remaining_locs:
+        # Find nearest next location
+        nearest_idx = None
+        min_dist = float('inf')
+
+        for i, loc in enumerate(remaining_locs):
+            route = get_osrm_route(current_loc, loc)
+            if route["duration"] < min_dist:
+                min_dist = route["duration"]
+                nearest_idx = i
+
+        # Add to path
+        next_loc = remaining_locs[nearest_idx]
+        path.append(next_loc)
+        ordered_schools.append(remaining_schools[nearest_idx])
+        ordered_indices.append(remaining_indices[nearest_idx])
+
+        # Update metrics
+        route = get_osrm_route(current_loc, next_loc)
+        total_time += route["duration"] + remaining_schools[nearest_idx]["service_time"]
+        total_distance += route["distance"]
+
+        # Update current location
+        current_loc = next_loc
+
+        # Remove visited location
+        remaining_locs.pop(nearest_idx)
+        remaining_schools.pop(nearest_idx)
+        remaining_indices.pop(nearest_idx)
+
+    # Return to kitchen
+    path.append(central_kitchen)
+    route = get_osrm_route(current_loc, central_kitchen)
+    total_time += route["duration"]
+    total_distance += route["distance"]
+
+    # Calculate total capacity
+    total_capacity = sum(school["demand"] for school in ordered_schools)
+
+    return {
+        "path": path,
+        "total_time": total_time,
+        "total_capacity": total_capacity,
+        "distance": total_distance,
+        "schools": ordered_schools,
+        "school_indices": ordered_indices
+    }
+
+
+def split_by_time_constraint(schools, school_indices, central_kitchen):
+    """Split route that exceeds time constraint"""
+    clusters = []
+    current_schools = []
+    current_indices = []
+    current_time = 0
+    current_capacity = 0
+
+    # Sort by distance to kitchen
+    school_distances = []
+    for i, school in enumerate(schools):
+        route = get_osrm_route(central_kitchen, (school["latitude"], school["longitude"]))
+        school_distances.append((i, school, route["duration"]))
+
+    sorted_schools = sorted(school_distances, key=lambda x: x[2])
+
+    for i, school, distance in sorted_schools:
+        # Calculate time if we add this school
+        if not current_schools:
+            # First school
+            travel_time = distance
+        else:
+            # Travel from last school
+            last_school = current_schools[-1]
+            travel_time = get_osrm_route(
+                (last_school["latitude"], last_school["longitude"]),
+                (school["latitude"], school["longitude"])
+            )["duration"]
+
+        # Total added time
+        added_time = travel_time + school["service_time"]
+
+        # Check constraints
+        if (current_time + added_time <= MAX_DELIVERY_TIME and
+                current_capacity + school["demand"] <= MAX_CAPACITY):
+            # Add school to current route
+            current_schools.append(school)
+            current_indices.append(school_indices[i])
+            current_time += added_time
+            current_capacity += school["demand"]
+        else:
+            # Create current cluster if not empty
+            if current_schools:
+                cluster = create_route(current_schools, current_indices, central_kitchen)
+                clusters.append(cluster)
+
+            # Start new cluster with this school
+            current_schools = [school]
+            current_indices = [school_indices[i]]
+            current_time = distance + school["service_time"]
+            current_capacity = school["demand"]
+
+    # Add final cluster if not empty
+    if current_schools:
+        cluster = create_route(current_schools, current_indices, central_kitchen)
+        clusters.append(cluster)
+
+    return clusters
+
+
+# === 6. Main Process ===
+def optimize_school_routes():
+    """Main function to optimize school delivery routes"""
+    # Process school data
+    print("Processing school data...")
+    processed_df = process_school_data(df_schools, central_kitchen)
+
+    # Select top schools
+    selected_schools = processed_df.head(MAX_SCHOOLS).copy()
+
+    # Perform clustering
+    print("Performing K-means clustering...")
+    # 修改这里的聚类数量为8或9
+    optimized_clusters = kmeans_clustering(selected_schools, central_kitchen, initial_clusters=7)
+
+    # Calculate total distance
+    total_distance = 0
+    for cluster in optimized_clusters:
+        cluster_id = cluster["cluster_id"]
+        num_schools = len(cluster["school_indices"])
+        total_time = cluster["total_time"]
+        total_capacity = cluster["total_capacity"]
+        distance = cluster["distance"]
+        path = [0] + cluster["school_indices"] + [0]  # Format: [0, school1, school2, ..., 0]
+        total_distance += distance
+        print(
+            f"{cluster_id:>7} | {num_schools:>7} | {total_time:>15.2f} | {total_capacity:>14} | {distance:>16.2f} | {path}")
+
+    print(f"\nTotal K-means Clustering Distance: {total_distance:.2f} km")
+
+    # Generate visualization
+    create_visualizations(optimized_clusters, selected_schools, central_kitchen, MAX_DELIVERY_TIME, MAX_CAPACITY)
+
+    # Create detailed schedule
+    create_detailed_schedule(optimized_clusters, selected_schools)
+
+    # Export results to Excel
+    export_to_excel(optimized_clusters, selected_schools)
+
+    return optimized_clusters, selected_schools
+
+# === 7. Visualization and Output ===
+def create_visualizations(clusters, selected_schools, central_kitchen, MAX_DELIVERY_TIME, MAX_CAPACITY,
+                          start_time=START_TIME, osrm_server="http://router.project-osrm.org"):
+
+    import matplotlib.pyplot as plt
+    import folium
+    import requests
+    from datetime import timedelta
+    import time
+    import polyline
+
+    # Create matplotlib visualization
+    plt.figure(figsize=(12, 10))
+
+    # 添加学校和中心厨房的坐标
+    kitchen_lat, kitchen_lon = central_kitchen
+    plt.plot(kitchen_lon, kitchen_lat, 'ks', markersize=10, label='Central Kitchen')
+
+    # 不同路线使用不同颜色
+    colors = ['blue', 'red', 'green', 'purple', 'orange', 'cyan', 'magenta', 'brown']
+
+    # 计算统计信息
+    total_schools = len(selected_schools)
+    total_clusters = len(clusters)
+
+    # 计算总体配送时间
+    overall_start_time = start_time
+    overall_end_time = start_time
+
+    # 跟踪所有路线的总配送时间
+    for cluster in clusters:
+        cluster_end_time = start_time
+        for school_idx in cluster["school_indices"]:
+            school_data = selected_schools.loc[school_idx]
+            delivery_time = school_data.get('delivery_time', 0)
+            service_time = school_data.get('service_time', 0)
+
+            # 计算这个学校的完成时间
+            cluster_end_time += timedelta(minutes=delivery_time + service_time)
+
+        # 更新整体结束时间(如果这个集群更晚结束)
+        if cluster_end_time > overall_end_time:
+            overall_end_time = cluster_end_time
+
+    # 计算总配送时间(分钟)
+    total_delivery_duration = (overall_end_time - overall_start_time).total_seconds() / 60
+
+    # 为每个集群绘制路线
+    for i, cluster in enumerate(clusters):
+        color = colors[i % len(colors)]
+        # 提取路径中的坐标
+        if "path" in cluster:
+            path = cluster["path"]
+            lats, lons = [], []
+            for point in path:
+                lat, lon = point
+                lats.append(lat)
+                lons.append(lon)
+
+            # 绘制路径线
+            plt.plot(lons, lats, '-', color=color, linewidth=2, label=f'Route {cluster.get("cluster_id", i)}')
+
+        # 在路径上标记学校
+        for j, school_idx in enumerate(cluster["school_indices"]):
+            school = selected_schools.loc[school_idx]
+            plt.plot(school["longitude"], school["latitude"], 'o', color=color, markersize=8)
+            plt.text(school["longitude"], school["latitude"], str(j + 1), fontsize=10)
+
+    plt.title('School Delivery Routes Optimization')
+    plt.xlabel('Longitude')
+    plt.ylabel('Latitude')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('school_detailed_routes(k-mean).png', dpi=300, bbox_inches='tight')
+    print("Created static visualization: school_detailed_routes(k-mean).png")
+
+    # 创建OSRM可视化地图
+    osrm_map = folium.Map(location=[kitchen_lat, kitchen_lon], zoom_start=12)
+
+    # 添加中心厨房详细标记
+    central_kitchen_popup = f"""
+    <div style='font-family: Arial, sans-serif; max-width: 300px;'>
+    <h3 style='color: #333;'>Central Kitchen Details</h3>
+    <p><strong>Location:</strong> {central_kitchen[0]}, {central_kitchen[1]}<br>
+    <strong>Total Schools Analyzed:</strong> {total_schools}<br>
+    <strong>Clusters Formed:</strong> {total_clusters}<br>
+    <strong>Delivery Constraints:</strong><br>
+    - Max Delivery Time: {MAX_DELIVERY_TIME} mins<br>
+    - Max Capacity: {MAX_CAPACITY} per cluster<br>
+    <strong>Delivery Start Time:</strong> {start_time.strftime("%H:%M")}<br>
+    <strong>Delivery End Time:</strong> {overall_end_time.strftime("%H:%M")}
+    </p>
+    </div>
+    """
+
+    folium.Marker(
+        location=central_kitchen,
+        popup=folium.Popup(central_kitchen_popup, max_width=350),
+        icon=folium.Icon(color='black', icon='home')
+    ).add_to(osrm_map)
+
+    # 添加地图信息控件
+    summary_html = f"""
+    <div style='
+        position: fixed; 
+        bottom: 10px; 
+        left: 10px; 
+        z-index: 9999; 
+        background-color: white; 
+        border: 2px solid #ccc; 
+        border-radius: 5px; 
+        padding: 10px; 
+        font-family: Arial, sans-serif; 
+        max-width: 350px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    '>
+        <h3 style='color: #333; margin-top: 0;'>Detailed Delivery Information</h3>
+        <hr style='border-top: 1px solid #ddd; margin: 5px 0;'>
+        <p style='margin: 5px 0;'>
+        <strong>Total Schools:</strong> {total_schools}<br>
+        <strong>Clusters Number:</strong> {total_clusters}<br>
+        <strong>Overall Delivery Start Time:</strong> {overall_start_time.strftime("%H:%M")}<br>
+        <strong>Overall Delivery End Time:</strong> {overall_end_time.strftime("%H:%M")}<br>
+        <strong>Total Duration:</strong> {total_delivery_duration:.2f} mins
+        </p>
+    </div>
+    """
+
+    # 添加摘要信息到地图
+    osrm_map.get_root().html.add_child(folium.Element(summary_html))
+
+    # 获取OSRM路线功能
+    def get_osrm_route(origin, destination):
+
+        url = f"{osrm_server}/route/v1/driving/{origin[1]},{origin[0]};{destination[1]},{destination[0]}"
+        params = {
+            "overview": "full",
+            "geometries": "geojson",
+            "annotations": "true"
+        }
+
+        try:
+            response = requests.get(url, params=params)
+            data = response.json()
+
+            if data["code"] == "Ok":
+                # 提取路线几何数据
+                coordinates = data["routes"][0]["geometry"]["coordinates"]
+                # OSRM返回[longitude, latitude]，但folium需要[latitude, longitude]
+                route_points = [[coord[1], coord[0]] for coord in coordinates]
+
+                # 提取距离和时间
+                distance = data["routes"][0]["distance"] / 1000  # 转换为公里
+                duration = data["routes"][0]["duration"] / 60  # 转换为分钟
+
+                # 获取原始geometry用于polyline解码
+                geometry = data["routes"][0]["geometry"]
+
+                return {
+                    "route_points": route_points,
+                    "distance": distance,
+                    "duration": duration,
+                    "geometry": geometry
+                }
+            else:
+                print(f"Error fetching OSRM route: {data['code']}")
+                # 返回直线作为后备
+                return {
+                    "route_points": [origin, destination],
+                    "distance": 0,
+                    "duration": 0,
+                    "geometry": None
+                }
+        except Exception as e:
+            print(f"Error fetching OSRM route: {e}")
+            # 返回直线作为后备
+            return {
+                "route_points": [origin, destination],
+                "distance": 0,
+                "duration": 0,
+                "geometry": None
+            }
+
+    # 跟踪总配送时间（用于每个学校的时间计算）
+    total_delivery_time = start_time
+
+    # 为每个集群添加路线
+    for i, cluster in enumerate(clusters):
+        color = colors[i % len(colors)]
+
+        # 跟踪集群特定详情
+        cluster_schools = []
+        cluster_details = []
+
+        # 获取有序点列表（包括开始和结束的中心厨房）
+        ordered_points = [central_kitchen]
+        for school_idx in cluster["school_indices"]:
+            school = selected_schools.loc[school_idx]
+            school_location = (school["latitude"], school["longitude"])
+            ordered_points.append(school_location)
+        ordered_points.append(central_kitchen)  # 返回中心厨房
+
+        # 处理每个学校
+        for j, school_idx in enumerate(cluster["school_indices"]):
+            school = selected_schools.loc[school_idx]
+
+            # 计算配送时间
+            delivery_time = school.get('delivery_time', 0)
+            service_time = school.get('service_time', 0)
+            return_time = school.get('return_time', 0)
+
+            # 计算精确时间
+            delivery_start_time = total_delivery_time
+            service_start_time = delivery_start_time + timedelta(minutes=delivery_time)
+            service_end_time = service_start_time + timedelta(minutes=service_time)
+            delivery_end_time = service_end_time + timedelta(minutes=return_time)
+
+            # 更新下一次迭代
+            total_delivery_time = delivery_end_time
+            details = {
+                'name': school.get('name', f'School {school_idx}'),
+                'delivery_start': delivery_start_time.strftime("%H:%M"),
+                'service_start': service_start_time.strftime("%H:%M"),
+                'service_end': service_end_time.strftime("%H:%M"),
+                'delivery_end': delivery_end_time.strftime("%H:%M"),
+                'demand': school.get('demand', 0)
+            }
+
+            # 添加学校详情用于弹出窗口
+            cluster_schools.append(details['name'])
+            cluster_details.append(details)
+
+            # 创建配送顺序数字标记
+            delivery_order = j + 1  # 从1开始
+
+            # 为每个学校创建详细的弹出窗口
+            school_popup = f"""
+            <div style='font-family: Arial, sans-serif; max-width: 300px;'>
+            <h3 style='color: #{color};'>School Details</h3>
+            <p>
+            <strong>Name:</strong> {details['name']}<br>
+            <strong>NPSN:</strong> {school.get('npsn', 'N/A')}<br>
+            <strong>Location:</strong> {school["latitude"]}, {school["longitude"]}<br>
+            <strong>Demand:</strong> {details['demand']}<br>
+            <strong>Cluster:</strong> {i}<br>
+            <strong>Delivery Order:</strong> {delivery_order}<br>
+            <br>
+            <strong>Delivery Schedule:</strong><br>
+            - Delivery Start: {details['delivery_start']}<br>
+            - Service Start: {details['service_start']}<br>
+            - Service End: {details['service_end']}<br>
+            - Delivery End: {details['delivery_end']}
+            </p>
+            </div>
+            """
+
+            # 显示配送顺序
+            folium.CircleMarker(
+                location=(school["latitude"], school["longitude"]),
+                radius=15,
+                color=color,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.7,
+                popup=folium.Popup(school_popup, max_width=350),
+            ).add_to(osrm_map)
+
+            # 添加路线方向指示
+            folium.map.Marker(
+                location=(school["latitude"], school["longitude"]),
+                icon=folium.DivIcon(
+                    icon_size=(20, 20),
+                    icon_anchor=(10, 10),
+                    html=f'<div style="font-size: 12px; color: white; font-weight: bold; text-align: center;">{delivery_order}</div>'
+                )
+            ).add_to(osrm_map)
+
+        # 集群路线详细弹出窗口
+        total_time = cluster.get('total_time_with_return', 0)
+        total_capacity = cluster.get('total_capacity', 0)
+        distance = cluster.get('distance', 0)
+
+        route_popup = f"""
+        <div style='font-family: Arial, sans-serif; max-width: 350px;'>
+        <h3 style='color: #{color};'>Cluster {i} Route Details</h3>
+        <hr style='border-top: 1px solid #ddd;'>
+        <p>
+        <strong>Schools in Cluster:</strong> {len(cluster["school_indices"])}<br>
+        <strong>School Names:</strong> {', '.join(cluster_schools)}<br>
+        <strong>Total Delivery Time:</strong> {total_time:.2f} mins<br>
+        <strong>Total Capacity:</strong> {total_capacity}<br>
+        <strong>Route Distance:</strong> {distance:.2f} km<br>
+        <strong>Delivery Sequence:</strong> Central Kitchen → {' → '.join([str(i + 1) for i in range(len(cluster["school_indices"]))])} → Central Kitchen
+        </p>
+        </div>
+        """
+
+        # 对路线的每个部分，获取实际道路路径
+        for k in range(len(ordered_points) - 1):
+            origin = ordered_points[k]
+            destination = ordered_points[k + 1]
+
+            # 使用OSRM获取路线点
+            route_info = get_osrm_route(origin, destination)
+            route_points = route_info["route_points"]
+
+            # 添加小延迟避免达到速率限制
+            time.sleep(0.2)
+
+            # 添加路线标记以显示段号
+            route_label = ""
+            if k == 0:
+                route_label = "Central Kitchen → School 1"
+            elif k == len(ordered_points) - 2:
+                route_label = f"School {k} → Central Kitchen"
+            else:
+                route_label = f"School {k} → School {k + 1}"
+
+            # 添加路线段到地图
+            route_line = folium.PolyLine(
+                locations=route_points,
+                color=color,
+                weight=3,
+                opacity=0.8,
+                popup=folium.Popup(route_popup, max_width=350) if k == 0 else None,
+                tooltip=f"{route_label} - Distance: {route_info['distance']:.2f} km, Duration: {route_info['duration']:.2f} min"
+            ).add_to(osrm_map)
+
+            # 添加箭头指引方向
+            if len(route_points) > 1:
+                middle_point = route_points[len(route_points) // 2]
+
+                # 使用小圆圈标记方向
+                folium.CircleMarker(
+                    location=middle_point,
+                    radius=3,
+                    color=color,
+                    fill=True,
+                    fill_opacity=1.0,
+                    tooltip=f"Orientation: {route_label}"
+                ).add_to(osrm_map)
+
+    # 添加图例
+    legend_html = """
+    <div style='
+        position: fixed; 
+        top: 10px; 
+        right: 10px; 
+        z-index: 9999; 
+        background-color: white; 
+        border: 2px solid #ccc; 
+        border-radius: 5px; 
+        padding: 10px; 
+        font-family: Arial, sans-serif; 
+        max-width: 200px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    '>
+        <h4 style='margin-top: 0;'>Legend</h4>
+        <div style='margin: 5px 0;'>
+            <i class='fa fa-home' style='color: black;'></i> Central Kitchen
+        </div>
+        <div style='margin: 5px 0;'>
+            <i class='fa fa-circle' style='color: red;'></i> School with Order
+        </div>
+        <div style='margin: 5px 0;'>
+            <i class='fa fa-road' style='color: blue;'></i> Delivery Route
+        </div>
+    </div>
+    """
+
+    # 添加图例到地图
+    osrm_map.get_root().html.add_child(folium.Element(legend_html))
+
+    # 保存OSRM地图
+    osrm_map.save('school_routes_map(k-mean).html')
+    print("Created interactive visualization: school_routes_map(k-mean).html with real road network routes using OSRM")
+
+def create_detailed_schedule(clusters, schools_df):
+    """Create a detailed delivery schedule with 4 decimal places for numerical values"""
+    print("\n=== Detailed School Delivery Route Information ===")
+    print(
+        " Cluster  School Index              School Name     NPSN  Latitude  Longitude  Demand Delivery Start Time Service Start Time Service End Time Delivery End Time  Delivery Time (mins)  Service Time (mins)  Return Time (mins)  Total Route Time (mins)  Stop Order in Cluster")
+
+    # 创建详细调度数据以便后续导出
+    schedule_data = []
+    current_time = START_TIME
+
+    for cluster in clusters:
+        cluster_id = cluster["cluster_id"]
+
+        # Start time for this cluster
+        cluster_start_time = current_time
+
+        # Track current time as we move through the route
+        route_time = cluster_start_time
+
+        # First leg: Kitchen to first school
+        first_school_idx = cluster["school_indices"][0]
+        first_school = schools_df.loc[first_school_idx]
+        first_loc = (first_school["latitude"], first_school["longitude"])
+
+        route_info = get_osrm_route(central_kitchen, first_loc)
+        delivery_time = route_info["duration"]
+
+        # Update time to arrival at first school
+        route_time += timedelta(minutes=delivery_time)
+
+        # Process each school in order
+        for i, school_idx in enumerate(cluster["school_indices"]):
+            school = schools_df.loc[school_idx]
+
+            # Current location
+            loc = (school["latitude"], school["longitude"])
+
+            # Calculate delivery time
+            if i == 0:
+                # Already calculated for first school
+                travel_time = delivery_time
+            else:
+                # Travel from previous school
+                prev_idx = cluster["school_indices"][i - 1]
+                prev_school = schools_df.loc[prev_idx]
+                prev_loc = (prev_school["latitude"], prev_school["longitude"])
+
+                route_info = get_osrm_route(prev_loc, loc)
+                travel_time = route_info["duration"]
+
+                # Update time after traveling to this school
+                route_time += timedelta(minutes=travel_time)
+
+            # Service start time
+            service_start_time = route_time
+
+            # Service time
+            service_time = school["service_time"]
+
+            # Service end time
+            route_time += timedelta(minutes=service_time)
+            service_end_time = route_time
+
+            # If this is the last school, calculate return time
+            if i == len(cluster["school_indices"]) - 1:
+                route_info = get_osrm_route(loc, central_kitchen)
+                return_time = route_info["duration"]
+
+                # Update final time
+                route_time += timedelta(minutes=return_time)
+            else:
+                # Get next school
+                next_idx = cluster["school_indices"][i + 1]
+                next_school = schools_df.loc[next_idx]
+                next_loc = (next_school["latitude"], next_school["longitude"])
+
+                # Calculate return time (for reporting)
+                route_info = get_osrm_route(loc, central_kitchen)
+                return_time = route_info["duration"]
+
+            # Calculate total route time for this stop
+            total_route_time = travel_time + service_time + return_time
+
+            # Format for printing
+            delivery_start_time_str = cluster_start_time.strftime("%H:%M")
+            service_start_time_str = service_start_time.strftime("%H:%M")
+            service_end_time_str = service_end_time.strftime("%H:%M")
+            delivery_end_time_str = (service_end_time + timedelta(minutes=return_time)).strftime("%H:%M")
+
+            # 存储调度数据
+            schedule_data.append({
+                "Cluster": cluster_id,
+                "School Index": school_idx,
+                "School Name": school['name'],
+                "NPSN": school['npsn'],
+                "Latitude": round(school['latitude'], 4),
+                "Longitude": round(school['longitude'], 4),
+                "Demand": round(school['demand'], 1),
+                "Delivery Start Time": delivery_start_time_str,
+                "Service Start Time": service_start_time_str,
+                "Service End Time": service_end_time_str,
+                "Delivery End Time": delivery_end_time_str,
+                "Delivery Time (mins)": round(travel_time, 1),
+                "Service Time (mins)": round(service_time, 1),
+                "Return Time (mins)": round(return_time, 1),
+                "Total Route Time (mins)": round(total_route_time, 1),
+                "Stop Order in Cluster": i + 1
+            })
+
+            # 打印输出
+            print(
+                f"{cluster_id:>8}  {school_idx:>12} {school['name']:>20} {school['npsn']:>8} {school['latitude']:>9.4f} {school['longitude']:>10.4f} {school['demand']:>7.1f} {delivery_start_time_str:>19} {service_start_time_str:>19} {service_end_time_str:>16} {delivery_end_time_str:>17} {travel_time:>21.1f} {service_time:>20.1f} {return_time:>19.1f} {total_route_time:>24.1f} {i + 1:>22}")
+
+        # Update current time for next cluster
+        current_time = route_time
+
+    # 返回详细调度数据以便导出
+    return schedule_data
+
+def export_to_excel(clusters, schools_df):
+    """Export optimized routes to Excel with 4 decimal places formatting"""
+    print("\nExporting results to Excel...")
+
+    # 创建详细调度数据
+    schedule_data = create_detailed_schedule(clusters, schools_df)
+
+    # 创建DataFrame
+    schedule_df = pd.DataFrame(schedule_data)
+
+    # 创建Excel写入器
+    with pd.ExcelWriter('school_delivery_schedule.xlsx', engine='openpyxl') as writer:
+        # 导出详细调度表
+        schedule_df.to_excel(writer, sheet_name='Detailed Schedule', index=False)
+
+        # 获取工作簿和工作表
+        workbook = writer.book
+        worksheet = writer.sheets['Detailed Schedule']
+
+        # 设置数值列的格式为4位小数
+        numeric_columns = ['Latitude', 'Longitude', 'Demand',
+                           'Delivery Time (mins)', 'Service Time (mins)',
+                           'Return Time (mins)', 'Total Route Time (mins)']
+
+        # 获取这些列的索引（Excel列从1开始）
+        for col_idx, col_name in enumerate(schedule_df.columns, 1):
+            if col_name in numeric_columns:
+                for row_idx in range(2, len(schedule_df) + 2):  # 从第2行开始（跳过标题）
+                    cell = worksheet.cell(row=row_idx, column=col_idx)
+                    cell.number_format = '0.0'
+
+        # 创建聚类摘要表
+        summary_data = []
+        for cluster in clusters:
+            cluster_id = cluster["cluster_id"]
+            num_schools = len(cluster["school_indices"])
+            total_time = round(cluster["total_time"], 1)
+            total_capacity = cluster["total_capacity"]
+            distance = round(cluster["distance"], 1)
+            path = [0] + cluster["school_indices"] + [0]
+
+            summary_data.append({
+                "Cluster ID": cluster_id,
+                "Number of Schools": num_schools,
+                "Total Time (mins)": total_time,
+                "Total Capacity": total_capacity,
+                "Distance (km)": distance,
+                "Path": str(path)
+            })
+
+        # 创建摘要DataFrame并导出
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_excel(writer, sheet_name='Cluster Summary', index=False)
+
+        # 获取摘要工作表
+        summary_worksheet = writer.sheets['Cluster Summary']
+
+        # 设置摘要表中的数值列格式
+        for col_idx, col_name in enumerate(summary_df.columns, 1):
+            if col_name in ['Total Time (mins)', 'Distance (km)']:
+                for row_idx in range(2, len(summary_df) + 2):
+                    cell = summary_worksheet.cell(row=row_idx, column=col_idx)
+                    cell.number_format = '0.0'
+
+    print(f"Results exported to 'school_delivery_schedule(k-mean).xlsx'")
+
+
+# Run the optimization
+if __name__ == "__main__":
+    optimized_clusters, selected_schools = optimize_school_routes()
+
+    # Print summary
+    print("\n=== Optimized Routes Statistical Information ===")
+    print(f"Total Schools: {len(df_schools)}")
+    print(f"Selected Schools: {len(selected_schools)}")
+    print("Cluster | Schools | Total Time (min) | Total Capacity | Route Length (km) | Optimized Path")
+
+    total_distance = 0
+    all_paths = []
+    route_lengths = []
+    route_capacities = []
+
+    for cluster in optimized_clusters:
+        cluster_id = cluster["cluster_id"]
+        num_schools = len(cluster["school_indices"])
+        total_time = cluster["total_time"]
+        total_capacity = cluster["total_capacity"]
+        distance = cluster["distance"]
+        path = [0] + cluster["school_indices"] + [0]
+
+        all_paths.extend(path[:-1] if all_paths else path)
+        if all_paths[-1] != 0:
+            all_paths.append(0)
+
+        route_lengths.append(distance)
+        route_capacities.append(total_capacity)
+        total_distance += distance
+
+        print(
+            f"{cluster_id:>7} | {num_schools:>7} | {total_time:>15.1f} | {total_capacity:>14} | {distance:>16.1f} | {path}")
+
+    print(f"\nTotal Optimized Distance: {total_distance:.1f} km")
+    print(f"Complete Optimized Solution: {all_paths}")
+    print(f"Route Lengths (km): [{', '.join([f'{length:.1f}' for length in route_lengths])}]")
+    print(f"Route Capacities: {route_capacities}")
