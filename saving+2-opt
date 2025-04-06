@@ -15,14 +15,13 @@ import json
 df_schools = pd.read_csv(
     "C:/Users/ASUS/PycharmProjects/爬取多多买菜评论/results/schools_info_Kedungwaru.csv")  # Contains 'latitude', 'longitude', 'demand'
 central_kitchen = (-8.0506983, 111.911565)
-BATCH_SIZE = 50  # OSRM可以处理更大的批量请求
-OSRM_SERVER = "http://router.project-osrm.org"  # 公共OSRM服务器，也可以使用自己部署的服务器
+BATCH_SIZE = 10  # Google API request batch size limit for schools
+API_KEY = "AIzaSyAQMFuzox8FMM5xz_iKys68qYjs_cjsN04"  # Google Distance Matrix API Key
 
 MAX_DELIVERY_TIME = 90  # Maximum delivery time for each cluster area (minutes)
 MAX_CAPACITY = 400  # Maximum delivery capacity for each cluster area
 MAX_SCHOOLS = 20  # Maximum number of schools served by the catering center
 START_TIME = datetime.strptime("9:30", "%H:%M")  # Delivery start time
-
 
 # Service time linear function
 def calculate_service_time(demand):
@@ -30,57 +29,41 @@ def calculate_service_time(demand):
     time_per_person = 0.02  # Additional time per person
     return base_time + time_per_person * demand
 
+# === 2. Get Delivery Times with Google Maps API ===
+def get_batch_travel_times(origins, destinations):
+    origins_str = "|".join([f"{lat},{lng}" for lat, lng in origins])
+    destinations_str = "|".join([f"{lat},{lng}" for lat, lng in destinations])
 
-# === 2. Get Delivery Times with OSRM ===
-def get_batch_travel_times_osrm(origins, destinations):
+    url = f"https://maps.googleapis.com/maps/api/distancematrix/json?origins={origins_str}&destinations={destinations_str}&key={API_KEY}"
+    response = requests.get(url)
+    data = response.json()
 
-    origins_formatted = [f"{lng},{lat}" for lat, lng in origins]
-    destinations_formatted = [f"{lng},{lat}" for lat, lng in destinations]
-
-    # 构建表格请求URL
-    coordinates = ";".join(origins_formatted + destinations_formatted)
-    sources = ";".join([str(i) for i in range(len(origins))])
-    destinations_indices = ";".join([str(len(origins) + i) for i in range(len(destinations))])
-
-    url = f"{OSRM_SERVER}/table/v1/driving/{coordinates}?sources={sources}&destinations={destinations_indices}"
-
-    try:
-        response = requests.get(url)
-        data = response.json()
-
-        travel_times = []
-        if data.get("code") == "Ok":
-            # OSRM返回的是秒，转换为分钟
-            durations = data.get("durations", [])
-            for row in durations:
-                travel_times.append([duration / 60 if duration is not None else np.inf for duration in row])
-        else:
-            print(f"OSRM API错误: {data.get('message', '未知错误')}")
-            travel_times = [[np.inf] * len(destinations)] * len(origins)
-    except Exception as e:
-        print(f"请求OSRM API时出错: {e}")
+    travel_times = []
+    if data["status"] == "OK":
+        for row in data["rows"]:
+            travel_times.append(
+                [elem["duration"]["value"] / 60 if elem["status"] == "OK" else np.inf for elem in row["elements"]]
+            )
+    else:
         travel_times = [[np.inf] * len(destinations)] * len(origins)
 
     return travel_times
-
 
 # Initialize delivery and return times
 df_schools["delivery_time"] = np.nan
 df_schools["return_time"] = np.nan
 df_schools["service_time"] = df_schools["demand"].apply(calculate_service_time)
 
-# 批量获取行程时间
 for i in range(0, len(df_schools), BATCH_SIZE):
     batch = df_schools.iloc[i:i + BATCH_SIZE]
     origins = [(central_kitchen[0], central_kitchen[1])] * len(batch)
     destinations = list(zip(batch["latitude"], batch["longitude"]))
 
-    # 获取配送时间
-    travel_times = get_batch_travel_times_osrm(origins, destinations)
+    travel_times = get_batch_travel_times(origins, destinations)
     df_schools.loc[batch.index, "delivery_time"] = [time[0] for time in travel_times]
 
-    # 获取返回时间
-    return_times = get_batch_travel_times_osrm(destinations, origins)
+    # Calculate return times
+    return_times = get_batch_travel_times(destinations, origins)
     df_schools.loc[batch.index, "return_time"] = [time[0] for time in return_times]
 
 df_schools["total_time"] = df_schools["delivery_time"] + df_schools["service_time"]
@@ -108,39 +91,35 @@ def improved_constrained_clusters(schools_df, central_kitchen, max_time=MAX_DELI
     """Improved cluster creation based on savings algorithm"""
     clusters = []
     travel_time_cache = {}
-    OSRM_SERVER = "http://router.project-osrm.org"  # 公共OSRM服务器，也可以使用自己部署的服务器
 
     # Create a dictionary to record which route each school belongs to
     school_to_route = {}
 
     def get_cached_travel_time(origin, destination):
-        """Get travel time from cache, or via OSRM API if not exists"""
+        """Get travel time from cache, or via API if not exists"""
         key = (origin, destination)
         if key in travel_time_cache:
             return travel_time_cache[key]
 
-        # 使用OSRM API获取行程时间
-        # OSRM使用经度,纬度格式，与传统格式相反
-        origin_str = f"{origin[1]},{origin[0]}"
-        destination_str = f"{destination[1]},{destination[0]}"
-
-        url = f"{OSRM_SERVER}/route/v1/driving/{origin_str};{destination_str}?overview=false"
+        # Use Google Maps Distance Matrix API to get travel time
+        origins_str = f"{origin[0]},{origin[1]}"
+        destinations_str = f"{destination[0]},{destination[1]}"
+        url = f"https://maps.googleapis.com/maps/api/distancematrix/json?origins={origins_str}&destinations={destinations_str}&key={API_KEY}"
 
         try:
             response = requests.get(url, timeout=10)
             data = response.json()
 
-            if data.get("code") == "Ok" and len(data.get("routes", [])) > 0:
-                # OSRM返回的时间是秒，转换为分钟
-                travel_time = data["routes"][0]["duration"] / 60
+            if data["status"] == "OK" and data["rows"][0]["elements"][0]["status"] == "OK":
+                travel_time = data["rows"][0]["elements"][0]["duration"]["value"] / 60  # Convert seconds to minutes
                 travel_time_cache[key] = travel_time
-                travel_time_cache[(destination, origin)] = travel_time  # 假设双向行程时间相等
+                travel_time_cache[(destination, origin)] = travel_time  # Assume bidirectional equality
                 return travel_time
             else:
-                print(f"OSRM API错误: {data.get('message', '未知错误')}")
+                print(f"API Error: {data['status']}")
                 return np.inf
         except Exception as e:
-            print(f"请求错误: {e}")
+            print(f"Request Error: {e}")
             return np.inf
 
     # Initialize separate paths for each school
@@ -897,6 +876,7 @@ def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitc
 
     # 保存地图
     m.save('school_routes_map(saving + 2-opt).html')
+    print('The visualization map has been saved as school_routes_map(saving + 2-opt).html')
     return m
 
 # 生成详细报告和地图
@@ -908,3 +888,4 @@ create_osrm_maps_visualization(
     MAX_DELIVERY_TIME,
     MAX_CAPACITY
 )
+
