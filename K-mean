@@ -14,35 +14,39 @@ import os
 
 # === 1. Data Configuration ===
 df_schools = pd.read_csv(
-    "C:/Users/ASUS/PycharmProjects/爬取多多买菜评论/results/schools_info_Kedungwaru.csv")
+    "C:/Users/ASUS/PycharmProjects/爬取多多买菜评论/results/schools_info_Kedungwaru.csv")  # Contains 'latitude', 'longitude', 'demand'
 central_kitchen = (-8.0506983, 111.911565)
+BATCH_SIZE = 10  # Google API request batch size limit for schools
+API_KEY = "AIzaSyAQMFuzox8FMM5xz_iKys68qYjs_cjsN04"  # Google Distance Matrix API Key
+
 MAX_DELIVERY_TIME = 90  # Maximum delivery time for each cluster area (minutes)
 MAX_CAPACITY = 400  # Maximum delivery capacity for each cluster area
 MAX_SCHOOLS = 20  # Maximum number of schools served by the catering center
 START_TIME = datetime.strptime("9:30", "%H:%M")  # Delivery start time
 
-# === 2. Distance & Time Calculation===
-OSRM_BASE_URL = "http://router.project-osrm.org/route/v1/driving/"
 
+# === 2. Distance & Time Calculation===
 # Use LRU cache to efficiently store results
 @lru_cache(maxsize=1000)
-def get_osrm_route(origin, destination):
-    """Get route between two points using OSRM API with caching"""
-    url = f"{OSRM_BASE_URL}{origin[1]},{origin[0]};{destination[1]},{destination[0]}?overview=full&annotations=true"
+def get_google_route(origin, destination):
+    """Get route between two points using Google Maps API with caching"""
+    url = f"https://maps.googleapis.com/maps/api/directions/json?origin={origin[0]},{origin[1]}&destination={destination[0]},{destination[1]}&key={API_KEY}"
 
     try:
         response = requests.get(url)
         data = response.json()
 
-        if data.get("code") == "Ok" and "routes" in data and len(data["routes"]) > 0:
+        if data.get("status") == "OK" and "routes" in data and len(data["routes"]) > 0:
             # Extract duration (seconds -> minutes)
-            duration_minutes = data["routes"][0]["duration"] / 60
+            legs = data["routes"][0]["legs"]
+            duration_minutes = sum(leg["duration"]["value"] for leg in legs) / 60
 
             # Extract distance (meters -> kilometers)
-            distance_km = data["routes"][0]["distance"] / 1000
+            distance_km = sum(leg["distance"]["value"] for leg in legs) / 1000
 
             # Extract geometry for visualization
-            geometry = data["routes"][0]["geometry"]
+            geometry = data["routes"][0]["overview_polyline"]["points"] if "overview_polyline" in data["routes"][
+                0] else None
 
             return {
                 "duration": duration_minutes,
@@ -50,7 +54,7 @@ def get_osrm_route(origin, destination):
                 "geometry": geometry
             }
         else:
-            print(f"Error in OSRM response: {data}")
+            print(f"Error in Google API response: {data}")
             # Calculate fallback Euclidean distance (approximate)
             distance = math.sqrt(
                 (origin[0] - destination[0]) ** 2 +
@@ -67,7 +71,7 @@ def get_osrm_route(origin, destination):
             }
 
     except Exception as e:
-        print(f"OSRM API request error: {e}")
+        print(f"Google API request error: {e}")
         # Calculate fallback Euclidean distance
         distance = math.sqrt(
             (origin[0] - destination[0]) ** 2 +
@@ -83,6 +87,33 @@ def get_osrm_route(origin, destination):
             "geometry": None
         }
 
+
+def get_batch_travel_times(origins, destinations):
+    """Get travel times between multiple origins and destinations using Google Distance Matrix API"""
+    origins_str = "|".join([f"{lat},{lng}" for lat, lng in origins])
+    destinations_str = "|".join([f"{lat},{lng}" for lat, lng in destinations])
+
+    url = f"https://maps.googleapis.com/maps/api/distancematrix/json?origins={origins_str}&destinations={destinations_str}&key={API_KEY}"
+
+    try:
+        response = requests.get(url)
+        data = response.json()
+
+        travel_times = []
+        if data["status"] == "OK":
+            for row in data["rows"]:
+                travel_times.append(
+                    [elem["duration"]["value"] / 60 if elem["status"] == "OK" else np.inf for elem in row["elements"]]
+                )
+        else:
+            travel_times = [[np.inf] * len(destinations)] * len(origins)
+
+        return travel_times
+    except Exception as e:
+        print(f"Error in batch travel times: {e}")
+        return [[np.inf] * len(destinations)] * len(origins)
+
+
 def batch_get_travel_info(origins, destinations):
     """Get travel information between multiple origins and destinations"""
     if not isinstance(origins[0], (list, tuple)):
@@ -90,18 +121,28 @@ def batch_get_travel_info(origins, destinations):
     if not isinstance(destinations[0], (list, tuple)):
         destinations = [destinations]
 
-    results = []
-    for origin in origins:
-        row = []
-        for dest in destinations:
-            route_info = get_osrm_route(origin, dest)
-            row.append(route_info["duration"])
-        results.append(row)
+    # Use batch API for larger sets
+    if len(origins) * len(destinations) > 1:
+        # Split into batches if needed (Google API limits)
+        all_results = []
 
-    # Return appropriate shape based on input
-    if len(origins) == 1 and len(destinations) == 1:
-        return results[0][0]
-    return results
+        for i in range(0, len(origins), BATCH_SIZE):
+            batch_origins = origins[i:i + BATCH_SIZE]
+            batch_results = []
+
+            for j in range(0, len(destinations), BATCH_SIZE):
+                batch_destinations = destinations[j:j + BATCH_SIZE]
+                batch_travel_times = get_batch_travel_times(batch_origins, batch_destinations)
+                batch_results.extend(batch_travel_times)
+
+            all_results.extend(batch_results)
+
+        return all_results
+    else:
+        # For single route, use directions API for more details
+        route_info = get_google_route(origins[0], destinations[0])
+        return route_info["duration"]
+
 
 # Service time calculation function
 def calculate_service_time(demand):
@@ -119,7 +160,7 @@ def process_school_data(df_schools, central_kitchen):
     processed_df["service_time"] = processed_df["demand"].apply(calculate_service_time)
 
     # Calculate delivery and return times - process in smaller batches to avoid overwhelming API
-    batch_size = 10
+    batch_size = BATCH_SIZE
     processed_df["delivery_time"] = np.nan
     processed_df["return_time"] = np.nan
 
@@ -127,15 +168,17 @@ def process_school_data(df_schools, central_kitchen):
         batch = processed_df.iloc[i:i + batch_size]
         batch_coords = list(zip(batch["latitude"], batch["longitude"]))
 
-        # Get delivery times (kitchen to school)
-        for j, coords in enumerate(batch_coords):
-            idx = batch.index[j]
-            route = get_osrm_route(central_kitchen, coords)
-            processed_df.loc[idx, "delivery_time"] = route["duration"]
+        # Get delivery times (kitchen to school) using batch API
+        kitchen_coords = [central_kitchen] * len(batch_coords)
+        delivery_times = get_batch_travel_times([central_kitchen], batch_coords)[0]
 
-            # Get return times (school to kitchen)
-            route = get_osrm_route(coords, central_kitchen)
-            processed_df.loc[idx, "return_time"] = route["duration"]
+        # Get return times (school to kitchen) using batch API
+        return_times = get_batch_travel_times(batch_coords, [central_kitchen])
+
+        for j, (delivery, return_time) in enumerate(zip(delivery_times, return_times)):
+            idx = batch.index[j]
+            processed_df.loc[idx, "delivery_time"] = delivery
+            processed_df.loc[idx, "return_time"] = return_time[0]  # Extract single value from list
 
     # Calculate total time
     processed_df["total_time"] = processed_df["delivery_time"] + processed_df["service_time"] + processed_df[
@@ -182,7 +225,7 @@ def kmeans_clustering(schools_df, central_kitchen, initial_clusters=4):
 
             # Calculate distance to kitchen for proper sorting
             cluster_df["dist_to_kitchen"] = cluster_df.apply(
-                lambda row: get_osrm_route(central_kitchen, (row["latitude"], row["longitude"]))["distance"],
+                lambda row: get_google_route((row["latitude"], row["longitude"]), central_kitchen)["distance"],
                 axis=1
             )
 
@@ -259,7 +302,7 @@ def create_route(schools, school_indices, central_kitchen):
     min_distance = float('inf')
 
     for i, loc in enumerate(locations):
-        route = get_osrm_route(central_kitchen, loc)
+        route = get_google_route(central_kitchen, loc)
         if route["duration"] < min_distance:
             min_distance = route["duration"]
             best_idx = i
@@ -279,7 +322,7 @@ def create_route(schools, school_indices, central_kitchen):
 
     # Build route using nearest neighbor
     total_time = min_distance + schools[best_idx]["service_time"]
-    total_distance = get_osrm_route(central_kitchen, current_loc)["distance"]
+    total_distance = get_google_route(central_kitchen, current_loc)["distance"]
 
     while remaining_locs:
         # Find nearest next location
@@ -287,7 +330,7 @@ def create_route(schools, school_indices, central_kitchen):
         min_dist = float('inf')
 
         for i, loc in enumerate(remaining_locs):
-            route = get_osrm_route(current_loc, loc)
+            route = get_google_route(current_loc, loc)
             if route["duration"] < min_dist:
                 min_dist = route["duration"]
                 nearest_idx = i
@@ -299,7 +342,7 @@ def create_route(schools, school_indices, central_kitchen):
         ordered_indices.append(remaining_indices[nearest_idx])
 
         # Update metrics
-        route = get_osrm_route(current_loc, next_loc)
+        route = get_google_route(current_loc, next_loc)
         total_time += route["duration"] + remaining_schools[nearest_idx]["service_time"]
         total_distance += route["distance"]
 
@@ -313,7 +356,7 @@ def create_route(schools, school_indices, central_kitchen):
 
     # Return to kitchen
     path.append(central_kitchen)
-    route = get_osrm_route(current_loc, central_kitchen)
+    route = get_google_route(current_loc, central_kitchen)
     total_time += route["duration"]
     total_distance += route["distance"]
 
@@ -341,7 +384,7 @@ def split_by_time_constraint(schools, school_indices, central_kitchen):
     # Sort by distance to kitchen
     school_distances = []
     for i, school in enumerate(schools):
-        route = get_osrm_route(central_kitchen, (school["latitude"], school["longitude"]))
+        route = get_google_route(central_kitchen, (school["latitude"], school["longitude"]))
         school_distances.append((i, school, route["duration"]))
 
     sorted_schools = sorted(school_distances, key=lambda x: x[2])
@@ -354,7 +397,7 @@ def split_by_time_constraint(schools, school_indices, central_kitchen):
         else:
             # Travel from last school
             last_school = current_schools[-1]
-            travel_time = get_osrm_route(
+            travel_time = get_google_route(
                 (last_school["latitude"], last_school["longitude"]),
                 (school["latitude"], school["longitude"])
             )["duration"]
@@ -402,7 +445,7 @@ def optimize_school_routes():
 
     # Perform clustering
     print("Performing K-means clustering...")
-    # 修改这里的聚类数量为8或9
+    # 修改这里的聚类数量为7
     optimized_clusters = kmeans_clustering(selected_schools, central_kitchen, initial_clusters=7)
 
     # Calculate total distance
@@ -430,6 +473,7 @@ def optimize_school_routes():
     export_to_excel(optimized_clusters, selected_schools)
 
     return optimized_clusters, selected_schools
+
 
 # === 7. Visualization and Output ===
 def create_visualizations(clusters, selected_schools, central_kitchen, MAX_DELIVERY_TIME, MAX_CAPACITY,
@@ -832,7 +876,7 @@ def create_detailed_schedule(clusters, schools_df):
         first_school = schools_df.loc[first_school_idx]
         first_loc = (first_school["latitude"], first_school["longitude"])
 
-        route_info = get_osrm_route(central_kitchen, first_loc)
+        route_info = get_google_route(central_kitchen, first_loc)
         delivery_time = route_info["duration"]
 
         # Update time to arrival at first school
@@ -855,7 +899,7 @@ def create_detailed_schedule(clusters, schools_df):
                 prev_school = schools_df.loc[prev_idx]
                 prev_loc = (prev_school["latitude"], prev_school["longitude"])
 
-                route_info = get_osrm_route(prev_loc, loc)
+                route_info = get_google_route(prev_loc, loc)
                 travel_time = route_info["duration"]
 
                 # Update time after traveling to this school
@@ -873,7 +917,7 @@ def create_detailed_schedule(clusters, schools_df):
 
             # If this is the last school, calculate return time
             if i == len(cluster["school_indices"]) - 1:
-                route_info = get_osrm_route(loc, central_kitchen)
+                route_info = get_google_route(loc, central_kitchen)
                 return_time = route_info["duration"]
 
                 # Update final time
@@ -885,7 +929,7 @@ def create_detailed_schedule(clusters, schools_df):
                 next_loc = (next_school["latitude"], next_school["longitude"])
 
                 # Calculate return time (for reporting)
-                route_info = get_osrm_route(loc, central_kitchen)
+                route_info = get_google_route(loc, central_kitchen)
                 return_time = route_info["duration"]
 
             # Calculate total route time for this stop
