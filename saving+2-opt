@@ -571,16 +571,31 @@ print(f"Total Schools: {total_schools_count}")
 print(f"Selected Schools: {selected_schools_count}")
 print("Cluster | Schools | Total Time (min)| Total Capacity | Route Length (km) | Optimized Path")
 
+total_distance = 0
+total_time = 0
+start_time = datetime.strptime("09:30", "%H:%M")
+end_time = start_time
+
 # 输出每个聚类的统计信息
 for cluster in constrained_clusters:
     cluster_id = cluster["cluster_id"]
     num_schools = len(cluster["school_indices"])
-    total_time = cluster["total_time_with_return"]
+    total_cluster_time = cluster["total_time_with_return"]
     total_capacity = cluster["total_capacity"]
     distance = cluster["distance"]
     path = [0] + cluster["school_indices"] + [0]  # Format: [0, school1, school2, ..., 0]
-    print(
-        f"{cluster_id:>7} | {num_schools:>7} | {total_time:>15.2f} | {total_capacity:>14} | {distance:>16.2f} | {path}")
+    total_distance += distance
+    # 计算每个集群的结束时间
+    cluster_end_time = start_time + timedelta(minutes=total_cluster_time)
+    if cluster_end_time > end_time:
+        end_time = cluster_end_time
+    print(f"{cluster_id:>7} | {num_schools:>7} | {total_cluster_time:>15.2f} | {total_capacity:>14} | {distance:>16.2f} | {path}")
+
+# 计算总时长
+total_time = (end_time - start_time).total_seconds() / 60
+
+print(f"\nTotal Distance: {total_distance:.2f} km")
+print(f"Total Time: {total_time:.2f} mins")
 
 # 构建所有路线的优化解
 all_routes = []
@@ -595,7 +610,6 @@ if all_routes[-1] != 0:
 print(f"Complete Optimized Solution: {all_routes}")
 print(f"Route Lengths (km): {[round(cluster['distance'], 2) for cluster in constrained_clusters]}")
 print(f"Route Capacities: {[round(cluster['total_capacity'], 1) for cluster in constrained_clusters]}")
-
 
 def generate_detailed_school_report(df_result, constrained_clusters, start_time=START_TIME):
     # 创建详细报告DataFrame
@@ -651,7 +665,7 @@ def generate_detailed_school_report(df_result, constrained_clusters, start_time=
 def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitchen, MAX_DELIVERY_TIME, MAX_CAPACITY,
                                    start_time=START_TIME, osrm_server="http://router.project-osrm.org"):
     # 创建地图，以中央厨房为中心
-    m = folium.Map(location=[central_kitchen[0], central_kitchen[1]], zoom_start=10)
+    m = folium.Map(location=[central_kitchen[0], central_kitchen[1]], zoom_start=12)
 
     # 为不同集群设置不同颜色
     colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 'lightred', 'beige']
@@ -884,7 +898,6 @@ def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitc
     # 保存地图
     m.save('school_routes_map(saving + 2-opt).html')
     return m
-
 
 # 生成详细报告和地图
 detailed_school_report = generate_detailed_school_report(df_result, constrained_clusters)
