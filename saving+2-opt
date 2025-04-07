@@ -13,7 +13,7 @@ import json
 
 # === 1. Data Configuration ===
 df_schools = pd.read_csv(
-    "C:/Users/ASUS/PycharmProjects/爬取多多买菜评论/results/schools_info_Kedungwaru.csv")  # Contains 'latitude', 'longitude', 'demand'
+    "/results/schools_info_Kedungwaru.csv")  # Contains 'latitude', 'longitude', 'demand'
 central_kitchen = (-8.0506983, 111.911565)
 BATCH_SIZE = 10  # Google API request batch size limit for schools
 API_KEY = "AIzaSyAQMFuzox8FMM5xz_iKys68qYjs_cjsN04"  # Google Distance Matrix API Key
@@ -643,10 +643,11 @@ def generate_detailed_school_report(df_result, constrained_clusters, start_time=
 
 def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitchen, MAX_DELIVERY_TIME, MAX_CAPACITY,
                                    start_time=START_TIME, osrm_server="http://router.project-osrm.org"):
-    # 创建地图，以中央厨房为中心
+
+    # Create matplotlib visualization,以中央厨房为中心
     m = folium.Map(location=[central_kitchen[0], central_kitchen[1]], zoom_start=12)
 
-    # 为不同集群设置不同颜色
+    # 不同路线使用不同颜色
     colors = ['red', 'blue', 'green', 'purple', 'orange', 'darkred', 'lightred', 'beige']
 
     # 计算统计信息
@@ -679,16 +680,15 @@ def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitc
     # 添加中央厨房标记
     central_kitchen_popup = f"""
     <div style='font-family: Arial, sans-serif; max-width: 300px;'>
-    <h3 style='color: #333;'>中央厨房详情</h3>
-    <p><strong>位置:</strong> {central_kitchen[0]}, {central_kitchen[1]}<br>
-    <strong>分析的学校总数:</strong> {len(df_result)}<br>
-    <strong>已选择学校:</strong> {len(df_result[df_result['cluster'] >= 0])}<br>
-    <strong>形成的集群:</strong> {len(constrained_clusters)}<br>
-    <strong>配送约束:</strong><br>
-    - 最大配送时间: {MAX_DELIVERY_TIME} 分钟<br>
-    - 最大容量: 每个集群 {MAX_CAPACITY}<br>
-    <strong>配送开始时间:</strong> {start_time.strftime("%H:%M")}<br>
-    <strong>配送结束时间:</strong> {overall_end_time.strftime("%H:%M")}
+    <h3 style='color: #333;'>Central Kitchen Details</h3>
+    <p><strong>Location:</strong> {central_kitchen[0]}, {central_kitchen[1]}<br>
+    <strong>Selected Schools:</strong> {len(df_result[df_result['cluster'] >= 0])}<br>
+    <strong>Clusters Formed:</strong> {len(constrained_clusters)}<br>
+    <strong>Delivery Constraints:</strong><br>
+    - Max Delivery Time: {MAX_DELIVERY_TIME} mins<br>
+    - Max Capacity: {MAX_CAPACITY} per cluster<br>
+    <strong>Delivery Start Time:</strong> {start_time.strftime("%H:%M")}<br>
+    <strong>Delivery End Time:</strong> {overall_end_time.strftime("%H:%M")}
     </p>
     </div>
     """
@@ -714,14 +714,74 @@ def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitc
             if data["code"] == "Ok":
                 coordinates = data["routes"][0]["geometry"]["coordinates"]
                 route_points = [[coord[1], coord[0]] for coord in coordinates]
-                return route_points
+                distance = data["routes"][0]["distance"] / 1000  # 转换为公里
+                duration = data["routes"][0]["duration"] / 60  # 转换为分钟
+                return route_points, distance, duration
             else:
-                return [origin, destination]  # 直线备选
+                return [origin, destination], 0, 0  # 直线备选
         except Exception as e:
-            return [origin, destination]  # 直线备选
+            return [origin, destination], 0, 0  # 直线备选
 
     # 跟踪总分配时间
     total_delivery_time = start_time
+
+    # 添加图例
+    legend_html =  """
+    <div style='
+        position: fixed; 
+        top: 10px; 
+        right: 10px; 
+        z-index: 9999; 
+        background-color: white; 
+        border: 2px solid #ccc; 
+        border-radius: 5px; 
+        padding: 10px; 
+        font-family: Arial, sans-serif; 
+        max-width: 200px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    '>
+        <h4 style='margin-top: 0;'>Legend</h4>
+        <div style='margin: 5px 0;'>
+            <i class='fa fa-home' style='color: black;'></i> Central Kitchen
+        </div>
+        <div style='margin: 5px 0;'>
+            <i class='fa fa-circle' style='color: red;'></i> School with Order
+        </div>
+        <div style='margin: 5px 0;'>
+            <i class='fa fa-road' style='color: blue;'></i> Delivery Route
+        </div>
+    </div>
+    """
+
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    # 添加详细配送信息
+    detailed_info_html = f'''
+    <div style='
+        position: fixed; 
+        bottom: 10px; 
+        left: 10px; 
+        z-index: 9999; 
+        background-color: white; 
+        border: 2px solid #ccc; 
+        border-radius: 5px; 
+        padding: 10px; 
+        font-family: Arial, sans-serif; 
+        max-width: 350px;
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    '>
+        <h3 style='color: #333; margin-top: 0;'>Detailed Delivery Information</h3>
+        <hr style='border-top: 1px solid #ddd; margin: 5px 0;'>
+        <p style='margin: 5px 0;'>
+        <div>Total Schools: {total_schools}</div>
+        <div>Clusters Number: {total_clusters}</div>
+        <div>Overall Delivery Start Time: {overall_start_time.strftime("%H:%M")}</div>
+        <div>Overall Delivery End Time: {overall_end_time.strftime("%H:%M")}</div>
+        <div>Total Duration: {total_delivery_duration:.2f} mins</div>
+        </p>
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(detailed_info_html))
 
     for cluster_idx, cluster in enumerate(constrained_clusters):
         # 为此集群选择颜色
@@ -775,20 +835,20 @@ def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitc
             # 为每个学校创建详细弹出窗口
             school_popup = f"""
             <div style='font-family: Arial, sans-serif; max-width: 300px;'>
-            <h3 style='color: #{cluster_color};'>学校详情</h3>
+            <h3 style='color: #{cluster_color};'>3. School Details</h3>
             <p>
-            <strong>名称:</strong> {details['name']}<br>
+            <strong>Name:</strong> {details['name']}<br>
             <strong>NPSN:</strong> {school_data.get('npsn', 'N/A')}<br>
-            <strong>位置:</strong> {school_data['latitude']}, {school_data['longitude']}<br>
-            <strong>需求:</strong> {details['demand']}<br>
-            <strong>集群:</strong> {cluster_idx}<br>
-            <strong>配送顺序:</strong> {delivery_order}<br>
+            <strong>Location:</strong> {school_data['latitude']}, {school_data['longitude']}<br>
+            <strong>Demand:</strong> {details['demand']}<br>
+            <strong>Cluster:</strong> {cluster_idx}<br>
+            <strong>Delivery Order:</strong> {delivery_order}<br>
             <br>
-            <strong>配送时间表:</strong><br>
-            - 配送开始: {details['delivery_start']}<br>
-            - 服务开始: {details['service_start']}<br>
-            - 服务结束: {details['service_end']}<br>
-            - 配送结束: {details['delivery_end']}
+            <strong>Delivery Schedule:</strong><br>
+            -Delivery Start: {details['delivery_start']}<br>
+            -Service Start: {details['service_start']}<br>
+            -Service End: {details['service_end']}<br>
+            -Delivery End: {details['delivery_end']}
             </p>
             </div>
             """
@@ -817,15 +877,15 @@ def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitc
         # 集群路线详细弹出窗口
         route_popup = f"""
         <div style='font-family: Arial, sans-serif; max-width: 350px;'>
-        <h3 style='color: #{cluster_color};'>集群 {cluster_idx} 路线详情</h3>
+        <h3 style='color: #{cluster_color};'>Cluster {cluster_idx} Route Details</h3>
         <hr style='border-top: 1px solid #ddd;'>
         <p>
-        <strong>集群中的学校:</strong> {len(cluster['school_indices'])}<br>
-        <strong>学校名称:</strong> {', '.join(cluster_schools)}<br>
-        <strong>总配送时间:</strong> {cluster['total_time_with_return']:.2f} 分钟<br>
-        <strong>总容量:</strong> {cluster['total_capacity']}<br>
-        <strong>路线距离:</strong> {cluster['distance']:.2f} 公里<br>
-        <strong>配送顺序:</strong> 中央厨房 → {' → '.join([str(i + 1) for i in range(len(cluster['school_indices']))])} → 中央厨房
+        <strong>Schools in Cluster:</strong> {len(cluster['school_indices'])}<br>
+        <strong>School Names:</strong> {', '.join(cluster_schools)}<br>
+        <strong>Total Delivery Time:</strong> {cluster['total_time_with_return']:.2f} mins<br>
+        <strong>Total Capacity:</strong> {cluster['total_capacity']}<br>
+        <strong>Route Distance:</strong> {cluster['distance']:.2f} km<br>
+        <strong>elivery Sequence:</strong> Central Kitchen → {' → '.join([str(i + 1) for i in range(len(cluster['school_indices']))])} → Central Kitchen
         </p>
         </div>
         """
@@ -836,19 +896,21 @@ def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitc
             destination = ordered_points[i + 1]
 
             # 使用OSRM获取路线点
-            route_points = get_osrm_route(origin, destination)
+            route_points, distance, duration = get_osrm_route(origin, destination)
 
             # 添加小延迟以避免超过速率限制
             time.sleep(0.2)
 
             # 添加路线标记以显示部分编号
-            route_label = ""
             if i == 0:
-                route_label = "中央厨房 → 学校 1"
+                route_label = f"Central Kitchen → School 1"
+                info_label = f"4. Central Kitchen → School 1 - Distance: {distance:.2f} km, Duration: {duration:.2f} min"
             elif i == len(ordered_points) - 2:
-                route_label = f"学校 {i} → 中央厨房"
+                route_label = f"School {i} → Central Kitchen"
+                info_label = f"4. School {i} → Central Kitchen - Distance: {distance:.2f} km, Duration: {duration:.2f} min"
             else:
-                route_label = f"学校 {i} → 学校 {i + 1}"
+                route_label = f"School {i} → School {i + 1}"
+                info_label = f"4. School {i} → School {i + 1} - Distance: {distance:.2f} km, Duration: {duration:.2f} min"
 
             # 向地图添加路线段
             route_line = folium.PolyLine(
@@ -857,7 +919,7 @@ def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitc
                 weight=3,
                 opacity=0.8,
                 popup=folium.Popup(route_popup, max_width=350) if i == 0 else None,
-                tooltip=route_label
+                tooltip=info_label
             ).add_to(m)
 
             # 添加指示方向的箭头
@@ -871,13 +933,14 @@ def create_osrm_maps_visualization(df_result, constrained_clusters, central_kitc
                     color=cluster_color,
                     fill=True,
                     fill_opacity=1.0,
-                    tooltip=f"方向: {route_label}"
+                    tooltip=info_label
                 ).add_to(m)
 
     # 保存地图
-    m.save('school_routes_map(saving + 2-opt).html')
-    print('The visualization map has been saved as school_routes_map(saving + 2-opt).html')
+    m.save('school_routes_map_enhanced.html')
+    print('The enhanced visualization map has been saved as school_routes_map_enhanced.html')
     return m
+
 
 # 生成详细报告和地图
 detailed_school_report = generate_detailed_school_report(df_result, constrained_clusters)
