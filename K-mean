@@ -14,7 +14,7 @@ import os
 
 # === 1. Data Configuration ===
 df_schools = pd.read_csv(
-    "C:/Users/ASUS/PycharmProjects/爬取多多买菜评论/results/schools_info_Kedungwaru.csv")  # Contains 'latitude', 'longitude', 'demand'
+    "/results/schools_info_Kedungwaru.csv")  # Contains 'latitude', 'longitude', 'demand'
 central_kitchen = (-8.0506983, 111.911565)
 BATCH_SIZE = 10  # Google API request batch size limit for schools
 API_KEY = "AIzaSyAQMFuzox8FMM5xz_iKys68qYjs_cjsN04"  # Google Distance Matrix API Key
@@ -559,7 +559,7 @@ def create_visualizations(clusters, selected_schools, central_kitchen, MAX_DELIV
     <div style='font-family: Arial, sans-serif; max-width: 300px;'>
     <h3 style='color: #333;'>Central Kitchen Details</h3>
     <p><strong>Location:</strong> {central_kitchen[0]}, {central_kitchen[1]}<br>
-    <strong>Total Schools Analyzed:</strong> {total_schools}<br>
+    <strong>Selected Schools:</strong> {total_schools}<br>
     <strong>Clusters Formed:</strong> {total_clusters}<br>
     <strong>Delivery Constraints:</strong><br>
     - Max Delivery Time: {MAX_DELIVERY_TIME} mins<br>
@@ -982,7 +982,7 @@ def export_to_excel(clusters, schools_df):
     schedule_df = pd.DataFrame(schedule_data)
 
     # 创建Excel写入器
-    with pd.ExcelWriter('school_delivery_schedule.xlsx', engine='openpyxl') as writer:
+    with pd.ExcelWriter('../school_delivery_schedule.xlsx', engine='openpyxl') as writer:
         # 导出详细调度表
         schedule_df.to_excel(writer, sheet_name='Detailed Schedule', index=False)
 
